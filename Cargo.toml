@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/app_core", "crates/renderer"]
+
+# app_wasm/ and web/ are wired in once the renderer baseline is proven.
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

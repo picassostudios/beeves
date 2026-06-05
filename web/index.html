@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>beavus</title>
+    <style>
+      :root {
+        --bg: #1b1d21;
+        --panel: #24272c;
+        --panel-border: #34383f;
+        --fg: #e6e8eb;
+        --fg-dim: #9aa0a8;
+        --accent: #5b9dff;
+        --accent-fg: #0c1220;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: var(--bg);
+        color: var(--fg);
+        font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+
+      #app {
+        display: flex;
+        flex-direction: column;
+        height: 100%;
+      }
+
+      #toolbar {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        flex: 0 0 auto;
+        padding: 8px 12px;
+        background: var(--panel);
+        border-bottom: 1px solid var(--panel-border);
+        user-select: none;
+      }
+
+      .tools {
+        display: flex;
+        gap: 4px;
+      }
+
+      .group {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .sep {
+        width: 1px;
+        align-self: stretch;
+        background: var(--panel-border);
+        margin: 2px 4px;
+      }
+
+      .spacer {
+        flex: 1 1 auto;
+      }
+
+      button {
+        font: inherit;
+        color: var(--fg);
+        background: #2d3137;
+        border: 1px solid var(--panel-border);
+        border-radius: 6px;
+        padding: 6px 12px;
+        cursor: pointer;
+      }
+
+      button:hover {
+        background: #353a41;
+      }
+
+      button.is-active {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--accent-fg);
+      }
+
+      label {
+        color: var(--fg-dim);
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      input[type="color"] {
+        width: 28px;
+        height: 28px;
+        padding: 0;
+        border: 1px solid var(--panel-border);
+        border-radius: 6px;
+        background: none;
+        cursor: pointer;
+      }
+
+      input[type="range"] {
+        width: 120px;
+        accent-color: var(--accent);
+      }
+
+      #brush-size-value,
+      #brush-hardness-value {
+        min-width: 2.5ch;
+        text-align: right;
+        color: var(--fg);
+      }
+
+      #status {
+        color: var(--fg-dim);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+
+      #status b {
+        color: var(--fg);
+        font-weight: 600;
+      }
+
+      #stage-wrap {
+        position: relative;
+        flex: 1 1 auto;
+        min-height: 0;
+      }
+
+      #stage {
+        display: block;
+        width: 100%;
+        height: 100%;
+        touch-action: none;
+        cursor: crosshair;
+      }
+
+      /* Vector-edit handle overlay, drawn on a 2D canvas above the WebGPU surface.
+         It is purely a view of Rust-owned geometry and must never intercept pointer
+         events — those belong to #stage. */
+      #edit-overlay {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+      }
+
+      #overlay {
+        position: absolute;
+        inset: 0;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        text-align: center;
+        background: rgba(15, 17, 20, 0.92);
+      }
+
+      #overlay.show {
+        display: flex;
+      }
+
+      #overlay .card {
+        max-width: 460px;
+      }
+
+      #overlay h1 {
+        font-size: 18px;
+        margin: 0 0 8px;
+      }
+
+      #overlay p {
+        margin: 0;
+        color: var(--fg-dim);
+        line-height: 1.6;
+      }
+
+      /* Hidden file input used by the Load button. */
+      #file-input {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="toolbar">
+        <div class="tools" id="tools">
+          <button type="button" data-tool="brush" title="Brush">Brush</button>
+          <button type="button" data-tool="bezier" title="Pen — place anchors, drag for curves">Pen</button>
+          <button type="button" data-tool="edit" title="Edit anchors &amp; handles (A)">Edit</button>
+          <button type="button" data-tool="sculpt" title="Sculpt">Sculpt</button>
+          <button type="button" data-tool="blend" title="Blend — smudge neighbouring gaussians' colours into each other (L)">Blend</button>
+          <button type="button" data-tool="select" title="Select">Select</button>
+          <button type="button" data-tool="pan" title="Pan">Pan</button>
+        </div>
+
+        <div class="sep"></div>
+
+        <div class="group">
+          <label for="brush-color">Color</label>
+          <input type="color" id="brush-color" value="#222222" />
+        </div>
+
+        <div class="group">
+          <label for="brush-size">Size</label>
+          <input type="range" id="brush-size" min="1" max="64" step="1" value="8" />
+          <span id="brush-size-value">8</span>
+        </div>
+
+        <div class="group">
+          <label for="brush-hardness">Hardness</label>
+          <input type="range" id="brush-hardness" min="0" max="1" step="0.05" value="0.6" />
+          <span id="brush-hardness-value">0.60</span>
+        </div>
+
+        <div class="group">
+          <label for="brush-edge-hardness">Edge</label>
+          <input type="range" id="brush-edge-hardness" min="0" max="1" step="0.05" value="0.95" />
+          <span id="brush-edge-hardness-value">0.95</span>
+        </div>
+
+        <div class="group">
+          <label for="crisp-edges">Crisp</label>
+          <input type="checkbox" id="crisp-edges" checked />
+        </div>
+
+        <div class="group">
+          <label for="blend-strength">Blend</label>
+          <input type="range" id="blend-strength" min="0" max="1" step="0.05" value="0.5" />
+          <span id="blend-strength-value">0.50</span>
+        </div>
+
+        <div class="sep"></div>
+
+        <div class="group">
+          <button type="button" id="save-btn" title="Save document">Save</button>
+          <button type="button" id="load-btn" title="Load document">Load</button>
+          <input type="file" id="file-input" accept=".json,application/json" />
+        </div>
+
+        <div class="spacer"></div>
+
+        <div id="status">splats: <b id="splat-count">0</b></div>
+      </div>
+
+      <div id="stage-wrap">
+        <canvas id="stage"></canvas>
+        <canvas id="edit-overlay"></canvas>
+        <div id="overlay">
+          <div class="card">
+            <h1 id="overlay-title">WebGPU not available</h1>
+            <p id="overlay-msg">
+              This app requires a browser with WebGPU support. Try the latest
+              Chrome, Edge, or Safari Technology Preview.
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

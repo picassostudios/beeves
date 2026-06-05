@@ -1,0 +1,33 @@
+# Standalone crate: the empty `[workspace]` table below makes Cargo treat this
+# directory as its own workspace root so it does not join the native workspace at
+# the repo root (which would otherwise share/contend on the target dir and pull in
+# native-only dependencies). app_core/renderer are path deps into that workspace.
+[workspace]
+
+[package]
+name = "app_wasm"
+description = "WASM bridge: glues app_core (model) + renderer (wgpu) to the browser."
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+app_core = { path = "../app_core" }
+renderer = { path = "../renderer" }
+wgpu = "29"
+glam = "0.30"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = ["HtmlCanvasElement", "Window", "Document", "Element"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"

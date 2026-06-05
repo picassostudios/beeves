@@ -1,0 +1,533 @@
+//! wgpu/WebGPU renderer for the Gaussian-Bezier splat field.
+//!
+//! The renderer is deliberately a thin, stateless-ish pass over GPU instances built from
+//! `app_core::splat::GpuSplat`. The editable model in `app_core` is the source of truth;
+//! GPU buffers here are disposable caches. The same pipeline/shader path runs headless on
+//! native (for tests/thumbnails) and against a browser surface in `app_wasm`.
+
+pub mod buffers;
+pub mod camera;
+pub mod coverage;
+pub mod gpu;
+pub mod picking;
+pub mod pipelines;
+pub mod scene;
+
+pub use camera::{Camera2D, CameraUniform};
+pub use gpu::GpuContext;
+pub use scene::SceneLayout;
+
+use app_core::document::Document;
+use app_core::splat::GpuSplat;
+use buffers::SplatBuffer;
+use pipelines::SplatPipeline;
+use scene::SceneLayout as Layout;
+
+/// Initial resident-buffer capacity (in splats). Sized so a handful of strokes fit before
+/// the first growth; growth doubles, so this only affects the very first frames.
+const MIN_RESIDENT_CAPACITY: usize = 256;
+
+/// Create a zeroed, GPU-resident storage buffer sized for `cap_splats` instances.
+fn create_resident_buffer(device: &wgpu::Device, cap_splats: usize) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("resident splat buffer"),
+        size: (cap_splats.max(1) * std::mem::size_of::<GpuSplat>()) as u64,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Draws instanced Gaussian splats into a color target.
+///
+/// Two paths share the pipeline: [`SplatRenderer::render_doc`] is the incremental, resident
+/// fast-path used by the app (reconciles + uploads only what changed, draws only what's in
+/// view); [`SplatRenderer::render`] is an immediate-mode path over a raw slice, kept for the
+/// headless shader tests.
+pub struct SplatRenderer {
+    pipeline: SplatPipeline,
+    /// Two-pass crisp-perimeter path (accumulate coverage + resolve). Owns its own offscreen
+    /// targets; see [`coverage`].
+    coverage: coverage::CoveragePipeline,
+    /// Immediate-mode transient buffer for `render(&[GpuSplat])`.
+    splats: SplatBuffer,
+    camera_buffer: wgpu::Buffer,
+    /// Persistent CPU layout mirror for the incremental `render_doc` path.
+    layout: Layout,
+    /// Persistent GPU buffer backing `render_doc`; grown with slack, never rebuilt per frame.
+    resident: wgpu::Buffer,
+    resident_capacity: usize,
+}
+
+impl SplatRenderer {
+    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let pipeline = SplatPipeline::new(device, target_format);
+        let coverage = coverage::CoveragePipeline::new(device, target_format);
+        let splats = SplatBuffer::new(device, &[]);
+        let camera_buffer = buffers::camera_buffer(device, &CameraUniform::default());
+        let resident_capacity = MIN_RESIDENT_CAPACITY;
+        let resident = create_resident_buffer(device, resident_capacity);
+        Self {
+            pipeline,
+            coverage,
+            splats,
+            camera_buffer,
+            layout: Layout::default(),
+            resident,
+            resident_capacity,
+        }
+    }
+
+    /// Incrementally render the whole document into `view`, clearing to `clear` first.
+    ///
+    /// Reconciles the resident buffer against `doc` — uploading only new/edited strokes via
+    /// `queue.write_buffer` at their stable offsets — then issues one draw per view-visible
+    /// stroke range (contiguous ranges merged). A camera-only frame uploads no splat data;
+    /// only the camera uniform and the O(strokes) visibility sweep run. `view_min`/`view_max`
+    /// is the visible world-space rectangle (used for coarse per-stroke culling).
+    /// Reconcile the resident buffer against `doc` (uploading only new/edited stroke slices)
+    /// and upload the camera uniform. Shared by [`Self::render_doc`] and
+    /// [`Self::render_doc_crisp`]; leaves the GPU buffers ready, draws nothing.
+    fn upload_doc(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        doc: &mut Document,
+        camera: &CameraUniform,
+    ) {
+        let dirty = self.layout.reconcile(doc);
+        let needed = self.layout.len();
+
+        if needed > self.resident_capacity {
+            // Grow with slack so repeated appends amortize to O(1). The whole mirror is
+            // re-uploaded once here, which subsumes the per-stroke dirty ranges.
+            let new_cap = (needed * 2).max(MIN_RESIDENT_CAPACITY);
+            self.resident = create_resident_buffer(device, new_cap);
+            self.resident_capacity = new_cap;
+            queue.write_buffer(&self.resident, 0, bytemuck::cast_slice(self.layout.mirror()));
+        } else {
+            let stride = std::mem::size_of::<GpuSplat>();
+            for (off, len) in dirty {
+                let slice = &self.layout.mirror()[off..off + len];
+                queue.write_buffer(
+                    &self.resident,
+                    (off * stride) as u64,
+                    bytemuck::cast_slice(slice),
+                );
+            }
+        }
+
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_doc(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        doc: &mut Document,
+        camera: &CameraUniform,
+        view_min: glam::Vec2,
+        view_max: glam::Vec2,
+        clear: wgpu::Color,
+    ) {
+        self.upload_doc(device, queue, doc, camera);
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resident splat bind group"),
+            layout: &self.pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.resident.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let ranges = self.layout.visible_ranges(view_min, view_max);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("splat encoder"),
+        });
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("splat pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(&self.pipeline.pipeline);
+            rpass.set_bind_group(0, &bind_group, &[]);
+            for (start, count) in ranges {
+                rpass.draw(0..6, start..start + count);
+            }
+        }
+        queue.submit(Some(encoder.finish()));
+    }
+
+    /// Drop resident scene state. Call when the document is replaced wholesale (e.g. on
+    /// load) so slots from the previous document don't linger.
+    pub fn reset_scene(&mut self) {
+        self.layout.clear();
+    }
+
+    /// Immediate-mode render of a raw `splats` slice into `view`, clearing to `clear` first.
+    /// Used by the headless shader tests; the app uses [`Self::render_doc`].
+    pub fn render(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        splats: &[GpuSplat],
+        camera: &CameraUniform,
+        clear: wgpu::Color,
+    ) {
+        self.splats.update(device, queue, splats);
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("splat bind group"),
+            layout: &self.pipeline.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.splats.buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("splat encoder"),
+            });
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("splat pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(&self.pipeline.pipeline);
+            rpass.set_bind_group(0, &bind_group, &[]);
+            rpass.draw(0..6, 0..self.splats.len as u32);
+        }
+        queue.submit(Some(encoder.finish()));
+    }
+
+    /// Crisp-perimeter twin of [`Self::render_doc`]: runs the two-pass coverage path
+    /// (accumulate → resolve) so the line's silhouette is one crisp antialiased edge while
+    /// its interior keeps per-splat color fuzz. `target_width`/`target_height` are the output
+    /// view's pixel size (used to size the offscreen accumulation targets).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_doc_crisp(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        doc: &mut Document,
+        camera: &CameraUniform,
+        view_min: glam::Vec2,
+        view_max: glam::Vec2,
+        target_width: u32,
+        target_height: u32,
+        clear: wgpu::Color,
+    ) {
+        self.upload_doc(device, queue, doc, camera);
+        let ranges = self.layout.visible_ranges(view_min, view_max);
+        self.coverage.ensure(device, target_width, target_height);
+        encode_crisp_passes(
+            device,
+            queue,
+            &self.coverage,
+            &self.camera_buffer,
+            &self.resident,
+            &ranges,
+            view,
+            clear,
+        );
+    }
+
+    /// Immediate-mode crisp render of a raw `splats` slice (headless tests / thumbnails). The
+    /// resident `render_doc_crisp` is the app path; this mirrors [`Self::render`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_crisp(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        splats: &[GpuSplat],
+        camera: &CameraUniform,
+        width: u32,
+        height: u32,
+        clear: wgpu::Color,
+    ) {
+        self.splats.update(device, queue, splats);
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        self.coverage.ensure(device, width, height);
+        let all = [(0u32, self.splats.len as u32)];
+        let ranges: &[(u32, u32)] = if self.splats.len == 0 { &[] } else { &all };
+        encode_crisp_passes(
+            device,
+            queue,
+            &self.coverage,
+            &self.camera_buffer,
+            &self.splats.buffer,
+            ranges,
+            view,
+            clear,
+        );
+    }
+}
+
+/// Encode and submit the two crisp-path passes: accumulate the splat instances in `ranges`
+/// into the coverage pipeline's offscreen targets, then resolve them into `view` (cleared to
+/// `clear` first). The caller must have already sized the targets via
+/// [`coverage::CoveragePipeline::ensure`] and uploaded the splat + camera buffers.
+#[allow(clippy::too_many_arguments)]
+fn encode_crisp_passes(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    coverage: &coverage::CoveragePipeline,
+    camera_buffer: &wgpu::Buffer,
+    splats_buffer: &wgpu::Buffer,
+    ranges: &[(u32, u32)],
+    view: &wgpu::TextureView,
+    clear: wgpu::Color,
+) {
+    let targets = coverage.current_targets();
+
+    let accum_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("coverage accum bind group"),
+        layout: &coverage.accum_bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: splats_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: camera_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    let resolve_bind_group = coverage.resolve_bind_group(device, targets);
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("crisp encoder"),
+    });
+
+    // Pass 1: accumulate color (additive) + coverage (max) into the offscreen targets.
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("coverage accum pass"),
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.color_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.coverage_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+            ],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rpass.set_pipeline(&coverage.accum_pipeline);
+        rpass.set_bind_group(0, &accum_bind_group, &[]);
+        for (start, count) in ranges {
+            rpass.draw(0..6, *start..*start + *count);
+        }
+    }
+
+    // Pass 2: resolve — threshold the accumulated coverage once for a crisp perimeter and
+    // composite the line over the cleared background.
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("coverage resolve pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rpass.set_pipeline(&coverage.resolve_pipeline);
+        rpass.set_bind_group(0, &resolve_bind_group, &[]);
+        rpass.draw(0..3, 0..1);
+    }
+
+    queue.submit(Some(encoder.finish()));
+}
+
+/// Collect every splat in a document into GPU instance form (in layer/stroke order).
+pub fn collect_gpu_splats(doc: &app_core::document::Document) -> Vec<GpuSplat> {
+    let mut out = Vec::with_capacity(doc.splat_count());
+    for (idx, stroke) in doc.strokes.values().enumerate() {
+        for splat in &stroke.splats {
+            out.push(GpuSplat::from_splat(splat, idx as u32));
+        }
+    }
+    out
+}
+
+/// Like `collect_gpu_splats`, but skips splats whose world-space AABB does not
+/// intersect `[view_min, view_max]` (the visible world rectangle). Stroke indices are
+/// preserved (every stroke is still enumerated) so `stroke_id` stays stable for picking.
+///
+/// This is a pure performance optimization on the disposable render cache: the canonical
+/// document is untouched and any splat even partially inside the view is kept (we test a
+/// per-splat AABB expanded by `radius_px + 2.0` world units, where the `+2` generously
+/// covers the EWA low-pass screen-space pad at any reasonable zoom).
+pub fn collect_gpu_splats_in_view(
+    doc: &app_core::document::Document,
+    view_min: glam::Vec2,
+    view_max: glam::Vec2,
+) -> Vec<GpuSplat> {
+    let mut out = Vec::with_capacity(doc.splat_count());
+    for (idx, stroke) in doc.strokes.values().enumerate() {
+        for splat in &stroke.splats {
+            let r = splat.radius_px + 2.0;
+            let c = splat.center;
+            let visible = c.x + r >= view_min.x
+                && c.x - r <= view_max.x
+                && c.y + r >= view_min.y
+                && c.y - r <= view_max.y;
+            if visible {
+                out.push(GpuSplat::from_splat(splat, idx as u32));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use app_core::brush::BrushModel;
+    use app_core::document::Document;
+    use app_core::{BezierSkeleton, CubicBezier};
+    use glam::Vec2;
+
+    /// Build a deterministic document with two strokes at known, well-separated world
+    /// positions so we can reason about which view rects overlap which splats. The first
+    /// stroke lives near the origin (~x in [0,160]); the second is shifted +1000 in x so
+    /// the two never overlap.
+    fn two_stroke_doc() -> Document {
+        let mut doc = Document::new();
+        let layer = doc.add_layer("L");
+        let a = CubicBezier::new(
+            Vec2::new(0.0, 0.0),
+            Vec2::new(40.0, 80.0),
+            Vec2::new(120.0, 80.0),
+            Vec2::new(160.0, 0.0),
+        );
+        doc.add_stroke(layer, BezierSkeleton::single(a), BrushModel::default());
+        let b = CubicBezier::new(
+            Vec2::new(1000.0, 0.0),
+            Vec2::new(1040.0, 80.0),
+            Vec2::new(1120.0, 80.0),
+            Vec2::new(1160.0, 0.0),
+        );
+        doc.add_stroke(layer, BezierSkeleton::single(b), BrushModel::default());
+        doc
+    }
+
+    #[test]
+    fn view_covering_everything_matches_unculled() {
+        let doc = two_stroke_doc();
+        let full = collect_gpu_splats(&doc);
+        let in_view = collect_gpu_splats_in_view(
+            &doc,
+            Vec2::new(-10_000.0, -10_000.0),
+            Vec2::new(10_000.0, 10_000.0),
+        );
+        assert_eq!(in_view.len(), full.len());
+        assert!(!full.is_empty(), "test doc should produce splats");
+    }
+
+    #[test]
+    fn view_far_away_culls_everything() {
+        let doc = two_stroke_doc();
+        let in_view = collect_gpu_splats_in_view(
+            &doc,
+            Vec2::new(100_000.0, 100_000.0),
+            Vec2::new(110_000.0, 110_000.0),
+        );
+        assert_eq!(in_view.len(), 0);
+    }
+
+    #[test]
+    fn partial_view_keeps_some_drops_others() {
+        let doc = two_stroke_doc();
+        let full = collect_gpu_splats(&doc);
+        // Tight box around only the first stroke (near the origin); the second stroke at
+        // x ~ 1000+ lies entirely outside, so we must keep some but not all.
+        let in_view = collect_gpu_splats_in_view(
+            &doc,
+            Vec2::new(-50.0, -50.0),
+            Vec2::new(200.0, 150.0),
+        );
+        assert!(!in_view.is_empty(), "first stroke should be visible");
+        assert!(
+            in_view.len() < full.len(),
+            "second far stroke should be culled"
+        );
+        // Every kept splat must reference a stroke index that exists in the full set,
+        // i.e. enumerate-based stroke_ids are unchanged by culling.
+        for s in &in_view {
+            assert!(
+                full.iter().any(|f| f.stroke_id == s.stroke_id),
+                "stroke_id {} must be preserved",
+                s.stroke_id
+            );
+        }
+    }
+}

@@ -1,0 +1,16 @@
+[package]
+name = "app_core"
+description = "Headless core for the Gaussian-Bezier design tool: document model, geometry, splat generation, and bidirectional splat<->curve synchronization."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.30", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+slotmap = { version = "1", features = ["serde"] }
+
+[lints.rust]
+unused_imports = "warn"

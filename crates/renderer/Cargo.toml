@@ -1,0 +1,22 @@
+[package]
+name = "renderer"
+description = "wgpu/WebGPU renderer for the Gaussian-Bezier splat field. Headless render-to-texture on native; surface rendering in the browser."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+app_core = { path = "../app_core" }
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.30"
+wgpu = "29"
+
+# Native-only: blocking executor for the headless context + tests, and a thread pool for
+# parallel per-stroke splat packing (#6). wasm has no thread pool without cross-origin
+# isolation, so the scene falls back to a serial pack there.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.4"
+rayon = "1"
+
+[dev-dependencies]
+pollster = "0.4"

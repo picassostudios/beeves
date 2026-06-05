@@ -1,0 +1,26 @@
+{
+  "name": "beavus-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Thin TypeScript + Vite shell over the Rust/WASM WasmApp.",
+  "scripts": {
+    "wasm": "cd ../crates/app_wasm && wasm-pack build --target web --out-dir ../../web/pkg",
+    "wasm:dev": "cd ../crates/app_wasm && wasm-pack build --dev --target web --out-dir ../../web/pkg",
+    "predev": "npm run wasm:dev",
+    "dev": "concurrently -k -n wasm,vite -c yellow,cyan npm:watch:wasm npm:dev:vite",
+    "dev:vite": "vite",
+    "watch:wasm": "cd ../crates/app_wasm && cargo watch -w src -w ../app_core/src -w ../renderer/src -w ../renderer/shaders -s 'wasm-pack build --dev --target web --out-dir ../../web/pkg'",
+    "prebuild": "npm run wasm",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.3",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.2",
+    "vite-plugin-top-level-await": "^1.4.4",
+    "vite-plugin-wasm": "^3.3.0"
+  }
+}
