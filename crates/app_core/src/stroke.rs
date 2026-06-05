@@ -76,6 +76,12 @@ pub struct GaussianBezierStroke {
     pub splats: Vec<GaussianSplat>,
     #[serde(default)]
     pub sync: SyncPolicy,
+    /// When true the stroke is drawn as a conventional vector — a tessellated, antialiased
+    /// stroked Bézier outline — instead of its Gaussian splat cloud. The splats are still
+    /// generated and kept (so hit-testing, selection, and direct-edit all keep working); the
+    /// renderer just skips them for this stroke and draws the path. Set by the vector-draw tool.
+    #[serde(default)]
+    pub render_as_vector: bool,
     #[serde(skip)]
     pub dirty_flags: StrokeDirtyFlags,
     /// Monotonic allocator for splat ids within this stroke.
@@ -93,6 +99,7 @@ impl GaussianBezierStroke {
             brush,
             splats: Vec::new(),
             sync: SyncPolicy::default(),
+            render_as_vector: false,
             dirty_flags: StrokeDirtyFlags::default(),
             next_splat_id: 0,
         };

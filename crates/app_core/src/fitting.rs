@@ -269,7 +269,7 @@ pub fn fit_polyline_adaptive(points: &[Vec2], params: &AdaptiveFitParams) -> Bez
 
     let turn = turning_angles(&pts);
     let corners = detect_corners(&pts, corner_turn);
-    let breakpoints = adaptive_breakpoints(&pts, &turn, &corners, max_turn, tol);
+    let breakpoints = adaptive_breakpoints(&pts, &turn, &corners, max_turn, tol, usize::MAX);
 
     // One cubic per [bp, next-bp] window.
     let mut segments: Vec<CubicBezier> = Vec::with_capacity(breakpoints.len().saturating_sub(1));
@@ -392,13 +392,16 @@ fn detect_corners(pts: &[Vec2], corner_turn: f32) -> Vec<bool> {
 /// Ordered breakpoint (anchor) indices along the resampled polyline: the two endpoints,
 /// every corner, and the adaptive interior splits. Within each smooth span a window grows
 /// while accumulated turning stays under `max_turn`, then is shrunk until a single cubic fits
-/// within `tol`.
+/// within `tol`. `max_window` caps a window at that many samples even on a perfectly straight
+/// run (where neither the turning budget nor the tolerance would ever close it) — used by the
+/// incremental fitter to keep the live open window bounded; pass `usize::MAX` to disable.
 fn adaptive_breakpoints(
     pts: &[Vec2],
     turn: &[f32],
     corners: &[bool],
     max_turn: f32,
     tol: f32,
+    max_window: usize,
 ) -> Vec<usize> {
     let n = pts.len();
     // Hard anchors that always split the path: endpoints + corners.
@@ -412,10 +415,11 @@ fn adaptive_breakpoints(
         let mut start = lo;
         while start < hi {
             // 1) Grow by the turning budget (cheap; no fitting). Invariant: `acc` is the
-            //    total turning of the window's interior vertices.
+            //    total turning of the window's interior vertices. The `end - start` guard
+            //    force-splits an otherwise-unbounded straight run at `max_window` samples.
             let mut end = start + 1;
             let mut acc = 0.0f32;
-            while end < hi && acc + turn[end] <= max_turn {
+            while end < hi && acc + turn[end] <= max_turn && end - start < max_window {
                 acc += turn[end];
                 end += 1;
             }
@@ -596,6 +600,223 @@ fn max_error(pts: &[Vec2], curve: &CubicBezier, u: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+// =====================================================================================
+// Incremental adaptive fitting (live drawing)
+// =====================================================================================
+//
+// [`fit_polyline_adaptive`] re-fits the *entire* polyline every call. Driven once per
+// pointer move that is O(n) per move and O(n^2) over a gesture — the longer the stroke, the
+// slower each move. [`IncrementalAdaptiveFit`] removes the quadratic by exploiting a property
+// the batch fitter already has but throws away: the fit's data dependencies are *local*.
+//
+// Within a span between hard anchors the windows are grown greedily from the start, so once a
+// window closes (the next one begins) its breakpoint is fixed by points local to it —
+// appending samples at the cursor never moves it. Corner joins are left with independent
+// tangents (see `smooth_interior_joins`), so a cubic *before* a corner is independent of
+// everything after it. We therefore **commit** (freeze) every window except the last one or
+// two near the cursor and only re-fit that short open tail. A `max_window` cap forces a commit
+// on long straight/corner-free runs that would otherwise keep one window open forever.
+//
+// Commit protocol, so frozen geometry never has to change:
+//   * the *last* window stays open (it ends at the moving cursor and re-fits every push);
+//   * a window is frozen only once a later window exists, so its forward join is already
+//     smoothed (`smooth_interior_joins` touches both sides of a smooth join);
+//   * at the boundary between committed and open we apply a *one-sided* smoothing — rotate
+//     only the open side's handle to match the frozen tangent — so the committed cubic is
+//     never touched while the join stays visually C1. Corner boundaries are left alone.
+
+/// Live, incremental counterpart to [`fit_polyline_adaptive`]. Feed raw pointer points one at
+/// a time with [`Self::push_point`]; read the current fit with [`Self::skeleton`]. Per-point
+/// cost is bounded by the open window length rather than the whole stroke.
+pub struct IncrementalAdaptiveFit {
+    params: AdaptiveFitParams,
+    /// Uniform arc-length resample of the raw input so far (append-only).
+    pts: Vec<Vec2>,
+    /// Streaming resample cursor: last walked point (an emitted sample during the inner loop,
+    /// then the last raw point) and arc length carried since the last *emitted* sample.
+    walk: Vec2,
+    carry: f32,
+    started: bool,
+    /// Latest raw point — used as a provisional tip so the open window reaches the cursor.
+    cursor: Vec2,
+    /// Frozen cubic per committed window.
+    committed: Vec<CubicBezier>,
+    /// Corner flag at the START anchor of each committed window (`committed_corner[0]` is the
+    /// stroke start: always `false`).
+    committed_corner: Vec<bool>,
+    /// Open (not-yet-frozen) windows near the cursor, rebuilt every push.
+    open: Vec<CubicBezier>,
+    /// Corner flag at the START anchor of each open window (`open_corner[0]` is the
+    /// committed/open boundary).
+    open_corner: Vec<bool>,
+    /// `pts` index of the boundary anchor (start of the first open window).
+    committed_at: usize,
+    /// Corner flag at `committed_at`; `open_corner[0]` mirrors it.
+    boundary_corner: bool,
+}
+
+impl IncrementalAdaptiveFit {
+    /// Cap (in resampled samples) on the open window, so per-push cost stays bounded even on a
+    /// dead-straight drag that neither the turning budget nor the tolerance would ever split.
+    /// At the zoom-aware resample step this is a few hundred px — far longer than any naturally
+    /// curving window, so it only ever bites pathological straight runs.
+    const MAX_WINDOW: usize = 128;
+
+    /// Start a fit at the gesture's first point.
+    pub fn new(params: AdaptiveFitParams, first: Vec2) -> Self {
+        Self {
+            params,
+            pts: vec![first],
+            walk: first,
+            carry: 0.0,
+            started: true,
+            cursor: first,
+            committed: Vec::new(),
+            committed_corner: Vec::new(),
+            open: Vec::new(),
+            open_corner: Vec::new(),
+            committed_at: 0,
+            boundary_corner: false,
+        }
+    }
+
+    fn step(&self) -> f32 {
+        self.params.resample_step.max(0.5)
+    }
+
+    /// Feed the next raw pointer point. Streams it into the uniform resample, then re-fits and
+    /// (where possible) freezes the open tail.
+    pub fn push_point(&mut self, raw: Vec2) {
+        self.cursor = raw;
+        if !self.started {
+            self.started = true;
+            self.pts.push(raw);
+            self.walk = raw;
+            self.carry = 0.0;
+        } else {
+            self.resample_to(raw);
+        }
+        self.refit_open();
+    }
+
+    /// Streaming form of [`resample_uniform`]: emit uniform-arc-length samples up to `raw`,
+    /// carrying the leftover length so spacing is continuous across calls.
+    fn resample_to(&mut self, raw: Vec2) {
+        let step = self.step();
+        let mut seg = raw - self.walk;
+        let mut seg_len = seg.length();
+        while self.carry + seg_len >= step && seg_len > 1e-9 {
+            let t = ((step - self.carry) / seg_len).clamp(0.0, 1.0);
+            let np = self.walk + seg * t;
+            self.pts.push(np);
+            self.walk = np;
+            seg = raw - self.walk;
+            seg_len = seg.length();
+            self.carry = 0.0;
+        }
+        self.carry += seg_len;
+        self.walk = raw;
+    }
+
+    /// Re-fit the open region `pts[committed_at..]` (plus the provisional cursor tip), then
+    /// freeze every window except the last.
+    fn refit_open(&mut self) {
+        let tol = self.params.tolerance.max(1e-3);
+        let max_turn = self.params.max_turn.max(0.05);
+        let corner_turn = self.params.corner_turn.max(0.05);
+
+        // Open input: the uncommitted resampled samples plus the live cursor as a provisional
+        // endpoint, so the last window tracks the cursor instead of lagging by up to one step.
+        let mut open_in: Vec<Vec2> = self.pts[self.committed_at..].to_vec();
+        if open_in
+            .last()
+            .map_or(true, |&p| (p - self.cursor).length() > 1e-4)
+        {
+            open_in.push(self.cursor);
+        }
+
+        if open_in.len() < 2 {
+            // Nothing to fit yet (single point). Leave the open region empty.
+            self.open.clear();
+            self.open_corner.clear();
+            return;
+        }
+
+        let turn = turning_angles(&open_in);
+        let corner = detect_corners(&open_in, corner_turn);
+        let bps = adaptive_breakpoints(&open_in, &turn, &corner, max_turn, tol, Self::MAX_WINDOW);
+
+        // One cubic per window, then smooth interior joins (corners left independent).
+        let mut segs: Vec<CubicBezier> = bps
+            .windows(2)
+            .map(|w| fit_cubic_lsq(&open_in[w[0]..=w[1]]).0)
+            .collect();
+        if segs.is_empty() {
+            self.open.clear();
+            self.open_corner.clear();
+            return;
+        }
+        smooth_interior_joins(&mut segs, &bps, &corner);
+        // One-sided smoothing at the committed boundary: align only the open side to the frozen
+        // outgoing tangent so the committed cubic is untouched but the join stays C1.
+        if !self.boundary_corner {
+            if let Some(last) = self.committed.last() {
+                let anchor = segs[0].p0;
+                let tang = (anchor - last.p2).normalize_or_zero();
+                if tang.length_squared() > 0.0 {
+                    let len_out = (segs[0].p1 - anchor).length();
+                    segs[0].p1 = anchor + tang * len_out;
+                }
+            }
+        }
+
+        // Per-window start-anchor corner flags (index 0 is the committed/open boundary).
+        let mut seg_corner: Vec<bool> = Vec::with_capacity(segs.len());
+        seg_corner.push(self.boundary_corner);
+        for w in bps.windows(2).skip(1) {
+            seg_corner.push(corner.get(w[0]).copied().unwrap_or(false));
+        }
+
+        // Freeze every window except the last (it still ends at the cursor). A window's end
+        // breakpoint maps back to a real `pts` index (only the very last point — the cursor — is
+        // provisional, and it is never an interior breakpoint).
+        let base = self.committed_at;
+        let freeze = segs.len() - 1;
+        for i in 0..freeze {
+            self.committed.push(segs[i]);
+            self.committed_corner.push(seg_corner[i]);
+            self.committed_at = base + bps[i + 1];
+            self.boundary_corner = corner.get(bps[i + 1]).copied().unwrap_or(false);
+        }
+
+        self.open = segs.split_off(freeze);
+        self.open_corner = vec![self.boundary_corner];
+    }
+
+    /// Assemble the current fit (committed + open windows) into a skeleton with per-anchor
+    /// corner flags set, matching [`fit_polyline_adaptive`]'s output contract.
+    pub fn skeleton(&self) -> BezierSkeleton {
+        let mut segs = self.committed.clone();
+        segs.extend_from_slice(&self.open);
+        if segs.is_empty() {
+            let p = self.pts.first().copied().unwrap_or(Vec2::ZERO);
+            return BezierSkeleton::single(straight_cubic(p, p + Vec2::new(1.0, 0.0)));
+        }
+
+        let mut flags = self.committed_corner.clone();
+        flags.extend_from_slice(&self.open_corner);
+        flags.push(false); // end endpoint
+
+        let mut sk = BezierSkeleton::from_segments(segs, false);
+        for (j, &f) in flags.iter().enumerate() {
+            if let Some(meta) = sk.anchors.get_mut(j) {
+                meta.corner = f;
+            }
+        }
+        sk
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -643,5 +864,161 @@ mod tests {
         let sk = fit_polyline_to_skeleton(&[Vec2::new(7.0, 7.0)], 1.0);
         assert_eq!(sk.segments.len(), 1);
         assert!(sk.total_length() > 0.0);
+    }
+
+    // --- Incremental adaptive fitter ------------------------------------------------
+
+    /// Max distance from any input point to the fitted skeleton. Each segment is sampled at
+    /// ~0.5px along its chord so the discrete-sample spacing never dominates the true geometric
+    /// deviation we are trying to measure.
+    fn max_dev_to_skeleton(sk: &BezierSkeleton, pts: &[Vec2]) -> f32 {
+        let mut samples = Vec::new();
+        for seg in &sk.segments {
+            let chord = (seg.p3 - seg.p0).length();
+            let n = ((chord * 2.0).ceil() as usize).clamp(16, 4096);
+            for k in 0..=n {
+                samples.push(seg.point(k as f32 / n as f32));
+            }
+        }
+        pts.iter()
+            .map(|&p| {
+                samples
+                    .iter()
+                    .map(|&s| (s - p).length())
+                    .fold(f32::INFINITY, f32::min)
+            })
+            .fold(0.0f32, f32::max)
+    }
+
+    /// A circular arc — high, sustained curvature so the fitter closes (and commits) several
+    /// windows over the course of the gesture.
+    fn arc(n: usize, sweep: f32) -> Vec<Vec2> {
+        (0..n)
+            .map(|i| {
+                let a = i as f32 / (n - 1) as f32 * sweep;
+                Vec2::new(80.0 * a.cos(), 80.0 * a.sin())
+            })
+            .collect()
+    }
+
+    fn feed(points: &[Vec2], params: &AdaptiveFitParams) -> IncrementalAdaptiveFit {
+        let mut fit = IncrementalAdaptiveFit::new(*params, points[0]);
+        for &p in &points[1..] {
+            fit.push_point(p);
+        }
+        fit
+    }
+
+    /// A smooth S-curve, no hard corners.
+    fn s_curve() -> Vec<Vec2> {
+        (0..=120)
+            .map(|i| {
+                let x = i as f32 * 2.0;
+                let y = 60.0 * (x * 0.012).sin();
+                Vec2::new(x, y)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn incremental_tracks_the_input_like_the_batch_fitter() {
+        let pts = s_curve();
+        let params = AdaptiveFitParams::default();
+        let inc = feed(&pts, &params).skeleton();
+        let batch = fit_polyline_adaptive(&pts, &params);
+
+        // Both should hug the input within a couple of px of the tolerance.
+        assert!(
+            max_dev_to_skeleton(&inc, &pts) < params.tolerance + 3.0,
+            "incremental deviation too high: {}",
+            max_dev_to_skeleton(&inc, &pts)
+        );
+        // Endpoints land on the gesture's ends.
+        assert!((inc.frame_at_arc_t(0.0).position - pts[0]).length() < 2.0);
+        assert!((inc.frame_at_arc_t(1.0).position - *pts.last().unwrap()).length() < 2.0);
+        // Anchor counts are in the same ballpark (incremental may add a couple from the cap).
+        let (ia, ba) = (inc.anchor_count(), batch.anchor_count());
+        assert!(
+            ia.abs_diff(ba) <= 3,
+            "incremental anchors {ia} vs batch {ba} diverge too much"
+        );
+    }
+
+    #[test]
+    fn committed_geometry_is_stable_as_more_points_arrive() {
+        // Feeding a prefix then more points must not move the early (committed) segments. A
+        // 1.5-turn arc curves enough that windows close (and commit) well before the prefix ends.
+        let pts = arc(240, 3.0 * std::f32::consts::PI);
+        let params = AdaptiveFitParams::default();
+
+        let mut fit = IncrementalAdaptiveFit::new(params, pts[0]);
+        for &p in &pts[1..140] {
+            fit.push_point(p);
+        }
+        let committed_prefix = fit.committed.clone();
+        assert!(
+            !committed_prefix.is_empty(),
+            "expected some committed windows partway through a long curved gesture"
+        );
+
+        for &p in &pts[140..] {
+            fit.push_point(p);
+        }
+        // The previously-committed windows are a byte-identical prefix of the final committed set.
+        for (old, new) in committed_prefix.iter().zip(&fit.committed) {
+            assert_eq!(old.p0, new.p0);
+            assert_eq!(old.p1, new.p1);
+            assert_eq!(old.p2, new.p2);
+            assert_eq!(old.p3, new.p3);
+        }
+    }
+
+    #[test]
+    fn incremental_preserves_a_sharp_corner() {
+        // An L: horizontal then vertical, with a hard 90° corner at (100, 0).
+        let mut pts = Vec::new();
+        for i in 0..=50 {
+            pts.push(Vec2::new(i as f32 * 2.0, 0.0));
+        }
+        for i in 1..=50 {
+            pts.push(Vec2::new(100.0, i as f32 * 2.0));
+        }
+        let sk = feed(&pts, &AdaptiveFitParams::default()).skeleton();
+        // The corner near (100,0) survives as a flagged anchor.
+        let corner = (0..sk.anchor_count()).any(|j| {
+            sk.anchors.get(j).map(|m| m.corner).unwrap_or(false)
+                && (sk.anchor_position(j) - Vec2::new(100.0, 0.0)).length() < 6.0
+        });
+        assert!(corner, "expected a corner anchor near the L's elbow");
+    }
+
+    #[test]
+    fn straight_run_stays_bounded_via_the_window_cap() {
+        // A long dead-straight drag has no corners and never exceeds tolerance, so without the
+        // cap it would keep one window open across the whole stroke. The cap must split it, so
+        // committed windows accumulate (proving the open region stays bounded).
+        let pts: Vec<Vec2> = (0..=2000).map(|i| Vec2::new(i as f32, 0.0)).collect();
+        let params = AdaptiveFitParams::default();
+        let fit = feed(&pts, &params);
+        assert!(
+            !fit.committed.is_empty(),
+            "the window cap should have forced commits on a long straight run"
+        );
+        // And the fit is still essentially the straight line.
+        assert!(max_dev_to_skeleton(&fit.skeleton(), &pts) < 2.0);
+    }
+
+    #[test]
+    fn incremental_handles_degenerate_inputs() {
+        let params = AdaptiveFitParams::default();
+        // One point: a usable (if tiny) skeleton, never a panic.
+        let one = IncrementalAdaptiveFit::new(params, Vec2::new(5.0, 5.0)).skeleton();
+        assert_eq!(one.segments.len(), 1);
+        // A stationary pointer (repeated identical points) stays degenerate-safe.
+        let mut still = IncrementalAdaptiveFit::new(params, Vec2::new(5.0, 5.0));
+        for _ in 0..10 {
+            still.push_point(Vec2::new(5.0, 5.0));
+        }
+        assert!(!still.skeleton().segments.is_empty());
     }
 }

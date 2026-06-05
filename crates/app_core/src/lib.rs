@@ -34,7 +34,10 @@ pub use blend::{blend_splats, smudge_splats, BlendCarry};
 pub use brush::{BrushModel, CurveProfile};
 pub use commands::{Command, History};
 pub use document::{BlendMode, CanvasSettings, ColorSpace, Document, Layer};
-pub use fitting::{fit_polyline_adaptive, fit_polyline_to_skeleton, simplify_rdp, AdaptiveFitParams};
+pub use fitting::{
+    fit_polyline_adaptive, fit_polyline_to_skeleton, simplify_rdp, AdaptiveFitParams,
+    IncrementalAdaptiveFit,
+};
 pub use ids::{LayerId, SplatId, StrokeId};
 pub use math::{covariance_from_sigmas, solve_spd, Rng};
 pub use selection::{hit_test_splat, SelectionState, SpatialGrid, SplatHit};

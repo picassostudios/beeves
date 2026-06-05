@@ -64,6 +64,13 @@ impl SceneLayout {
 
         for stroke in doc.strokes.values_mut() {
             let id = stroke.id;
+            // Vector-rendered strokes are drawn as tessellated paths (see
+            // `SplatRenderer::render_vector_paths`), not splats. Skip them here so they never
+            // enter the resident splat mirror. Not marking the slot `seen` lets the removal
+            // sweep reclaim a slot if a stroke is ever toggled to vector after the fact.
+            if stroke.render_as_vector {
+                continue;
+            }
             let is_new = !self.slots.contains_key(&id);
             if !is_new && !stroke.dirty_flags.gpu_upload {
                 // Unchanged: just mark it alive so the removal sweep keeps it.

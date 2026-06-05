@@ -11,7 +11,9 @@
 use app_core::blend::{blend_splats, smudge_splats, BlendCarry};
 use app_core::brush::BrushModel;
 use app_core::document::Document;
-use app_core::fitting::{fit_polyline_adaptive, fit_polyline_to_skeleton, AdaptiveFitParams};
+use app_core::fitting::{
+    fit_polyline_adaptive, fit_polyline_to_skeleton, AdaptiveFitParams, IncrementalAdaptiveFit,
+};
 use app_core::selection::hit_test_splat;
 use app_core::solver::{apply_splat_edits_bidirectional, sculpt_move_splats};
 use app_core::stroke::GaussianBezierStroke;
@@ -162,6 +164,10 @@ pub struct WasmApp {
     /// so the windows stay visible for inspection while the tool is selected. Read by
     /// [`WasmApp::vector_overlay`]; reset when a new vector stroke begins.
     vector_viz: Option<StrokeId>,
+    /// Incremental curvature-adaptive fitter for the in-progress vector stroke. `Some` only
+    /// during a vector-draw drag; it commits settled windows and re-fits just the open tail so
+    /// per-move cost stays bounded instead of growing with the stroke. See `pointer_move`.
+    vector_fit: Option<IncrementalAdaptiveFit>,
     /// Live keyboard-modifier state, pushed from JS via `set_modifiers` before each
     /// pointer event. `alt` breaks a smooth handle's tangent while dragging.
     mod_alt: bool,
@@ -312,6 +318,7 @@ impl WasmApp {
             pen: PenState::default(),
             edit: EditState::default(),
             vector_viz: None,
+            vector_fit: None,
             mod_alt: false,
             mod_shift: false,
             brush_color: [0.1, 0.2, 0.9, 1.0],
@@ -410,6 +417,16 @@ impl WasmApp {
             ),
         }
 
+        // Conventional vector strokes (`render_as_vector`) are skipped by the splat passes
+        // above; draw them as tessellated, antialiased stroked paths composited on top.
+        self.splat_renderer.render_vector_paths(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &view,
+            &self.doc,
+            &camera,
+        );
+
         frame.present();
     }
 
@@ -434,6 +451,9 @@ impl WasmApp {
                 // Clear the previous stroke's window highlight so a new gesture starts clean.
                 self.vector_viz = None;
                 self.pointer.polyline.push(world);
+                // Start a fresh incremental fit; the zoom-aware params are captured now and held
+                // for the whole gesture (zoom rarely changes mid-draw).
+                self.vector_fit = Some(IncrementalAdaptiveFit::new(self.vector_fit_params(), world));
             }
             Tool::Sculpt => {
                 // Resolve which stroke this interaction acts on (nearest splat under the
@@ -518,8 +538,13 @@ impl WasmApp {
             }
             Tool::VectorDraw => {
                 self.pointer.polyline.push(world);
-                // Live preview with the curvature-adaptive fitter; also refreshes the red
-                // window overlay (vector_viz) so anchors appear/dissolve as the path bends.
+                // Feed the incremental fitter one point; it commits settled windows and re-fits
+                // only the open tail, so this stays cheap no matter how long the stroke gets.
+                if let Some(fit) = self.vector_fit.as_mut() {
+                    fit.push_point(world);
+                }
+                // Live preview from the incremental fit; also refreshes the red window overlay
+                // (vector_viz) so anchors appear/dissolve as the path bends.
                 self.vector_rebuild_preview();
             }
             Tool::Sculpt => {
@@ -589,9 +614,20 @@ impl WasmApp {
         if self.tool == Tool::VectorDraw {
             if self.pointer.polyline.last() != Some(&world) {
                 self.pointer.polyline.push(world);
+                if let Some(fit) = self.vector_fit.as_mut() {
+                    fit.push_point(world);
+                }
             }
             if self.pointer.polyline.len() >= 2 {
                 self.vector_rebuild_preview();
+                // Splats were skipped during the drag (the preview renders as a tessellated
+                // vector path). Generate the final cloud once now so the committed stroke
+                // supports hit-testing and direct-edit.
+                if let Some(sid) = self.pointer.preview {
+                    if let Some(stroke) = self.doc.stroke_mut(sid) {
+                        stroke.regenerate_splats();
+                    }
+                }
                 // Keep the committed stroke; keep pointing the red overlay at it so its
                 // adaptive windows stay visible after release. Drop only our preview handle.
                 self.vector_viz = self.pointer.preview;
@@ -600,6 +636,8 @@ impl WasmApp {
                 self.brush_discard_preview();
                 self.vector_viz = None;
             }
+            // The gesture is over; release the incremental fitter.
+            self.vector_fit = None;
         }
 
         // Releasing ends the handle drag but keeps the pen path open for more anchors.
@@ -745,9 +783,11 @@ impl WasmApp {
     /// Geometry that visualizes the vector-draw tool's adaptive windows, in **device-pixel
     /// screen space**, as a flat `f32` array (a JS `Float32Array`). Each fitted segment is one
     /// adaptive window: long/sparse across straight runs, short/dense across tight curves. The
-    /// JS overlay (`drawVectorOverlay`) paints every segment red and every anchor as a marker
-    /// (a corner anchor as a filled diamond, a smooth one as a hollow square); the **last**
-    /// segment is the window still being grown, drawn brightest. Empty when no vector stroke is
+    /// segments are emitted in draw order, so the last point of the last segment is the stroke
+    /// **tip** (the point under the cursor). The JS overlay (`drawVectorOverlay`) renders the
+    /// red as a comet tail — opaque at the tip and fading to nothing a fixed distance back —
+    /// and draws each anchor as a marker (a corner anchor as a filled diamond, a smooth one as
+    /// a hollow square), faded by the same tip-relative falloff. Empty when no vector stroke is
     /// being shown.
     ///
     /// Layout:
@@ -1009,16 +1049,21 @@ impl WasmApp {
         fit_polyline_to_skeleton(points, tolerance)
     }
 
-    /// Fit `points` (world coords) with the curvature-adaptive fitter. Tolerance and the
-    /// resample step are zoom-aware (held at a roughly constant size on screen) so the same
-    /// gesture yields the same anchor density regardless of zoom level.
-    fn fit_vector_skeleton(&self, points: &[Vec2]) -> BezierSkeleton {
-        let params = AdaptiveFitParams {
+    /// Zoom-aware parameters for the curvature-adaptive fitter: tolerance and resample step are
+    /// held at a roughly constant size on screen, so the same gesture yields the same anchor
+    /// density regardless of zoom level.
+    fn vector_fit_params(&self) -> AdaptiveFitParams {
+        AdaptiveFitParams {
             tolerance: (1.5 / self.camera.zoom).max(0.25),
             resample_step: (3.0 / self.camera.zoom).max(0.75),
             ..AdaptiveFitParams::default()
-        };
-        fit_polyline_adaptive(points, &params)
+        }
+    }
+
+    /// Fit `points` (world coords) with the curvature-adaptive fitter (batch). Used as a
+    /// fallback; the live drag drives [`IncrementalAdaptiveFit`] instead (see `pointer_move`).
+    fn fit_vector_skeleton(&self, points: &[Vec2]) -> BezierSkeleton {
+        fit_polyline_adaptive(points, &self.vector_fit_params())
     }
 
     /// Fit `points` (world coords) to a skeleton and add a stroke on the current layer.
@@ -1037,37 +1082,61 @@ impl WasmApp {
             return;
         }
         let skeleton = self.fit_brush_skeleton(&self.pointer.polyline);
-        self.set_preview_stroke(skeleton);
+        self.set_preview_stroke(skeleton, false);
     }
 
     /// Rebuild (or create) the vector-draw tool's live preview from the in-progress polyline
     /// using the curvature-adaptive fitter, and point the red window overlay at it. Mirrors
-    /// [`Self::brush_rebuild_preview`] but with the adaptive fitter.
+    /// [`Self::brush_rebuild_preview`] but with the adaptive fitter, and flags the stroke for
+    /// conventional vector rendering (a stroked path, not splats).
     fn vector_rebuild_preview(&mut self) {
         if self.pointer.polyline.len() < 2 {
             self.brush_discard_preview();
             self.vector_viz = None;
             return;
         }
-        let skeleton = self.fit_vector_skeleton(&self.pointer.polyline);
-        self.set_preview_stroke(skeleton);
+        // Prefer the incremental fitter (cheap, O(open tail)); fall back to a batch fit if it is
+        // somehow absent (e.g. a stray rebuild outside a drag).
+        let skeleton = match self.vector_fit.as_ref() {
+            Some(fit) => fit.skeleton(),
+            None => self.fit_vector_skeleton(&self.pointer.polyline),
+        };
+        self.set_preview_stroke(skeleton, true);
         self.vector_viz = self.pointer.preview;
     }
 
     /// Update the active preview stroke (`pointer.preview`) to `skeleton` with the current
-    /// brush, creating it on the current layer if it does not exist yet. Shared by the brush
-    /// and vector-draw live previews.
-    fn set_preview_stroke(&mut self, skeleton: BezierSkeleton) {
+    /// brush, creating it on the current layer if it does not exist yet. `as_vector` marks the
+    /// stroke for conventional vector rendering. Shared by the brush and vector-draw previews.
+    ///
+    /// Vector previews are drawn by tessellating the skeleton each frame (the splat path skips
+    /// `render_as_vector` strokes), so their splats are invisible mid-drag. Regenerating the
+    /// whole splat cloud on every pointer move would be pure wasted O(n) work — the dominant
+    /// cost of a long vector stroke — so for vector previews we skip it and only clear the now
+    /// stale splats. The final cloud (needed for hit-testing/editing) is generated once on
+    /// release; see `pointer_up`.
+    fn set_preview_stroke(&mut self, skeleton: BezierSkeleton, as_vector: bool) {
         let brush = self.current_brush();
         match self.pointer.preview {
             Some(sid) if self.doc.stroke(sid).is_some() => {
                 let stroke = self.doc.stroke_mut(sid).expect("checked present above");
                 stroke.brush = brush;
                 stroke.skeleton = skeleton;
-                stroke.regenerate_splats();
+                stroke.render_as_vector = as_vector;
+                if as_vector {
+                    stroke.splats.clear();
+                } else {
+                    stroke.regenerate_splats();
+                }
             }
             _ => {
                 let sid = self.doc.add_stroke(self.layer, skeleton, brush);
+                if let Some(stroke) = self.doc.stroke_mut(sid) {
+                    stroke.render_as_vector = as_vector;
+                    if as_vector {
+                        stroke.splats.clear();
+                    }
+                }
                 self.pointer.preview = Some(sid);
             }
         }

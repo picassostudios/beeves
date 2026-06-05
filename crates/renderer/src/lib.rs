@@ -14,12 +14,14 @@ pub mod picking;
 pub mod pipelines;
 pub mod scene;
 pub mod triangle;
+pub mod vector;
 
 pub use camera::{Camera2D, CameraUniform};
 pub use convex::ConvexUniform;
 pub use gpu::GpuContext;
 pub use scene::SceneLayout;
 pub use triangle::TriangleUniform;
+pub use vector::{VectorPathPipeline, VectorVertex};
 
 use app_core::document::Document;
 use app_core::splat::GpuSplat;
@@ -80,6 +82,11 @@ pub struct SplatRenderer {
     /// Persistent GPU buffer backing `render_doc`; grown with slack, never rebuilt per frame.
     resident: wgpu::Buffer,
     resident_capacity: usize,
+    /// Conventional vector-path pipeline + growable vertex buffer, used to draw strokes flagged
+    /// `render_as_vector` as antialiased stroked outlines on top of the splat field.
+    vector: VectorPathPipeline,
+    /// Reused per-frame tessellation scratch so the vector pass never allocates.
+    vector_scratch: Vec<VectorVertex>,
 }
 
 impl SplatRenderer {
@@ -90,6 +97,7 @@ impl SplatRenderer {
         let convex_accum = ConvexAccumPipeline::new(device);
         let triangle = TriangleSplatPipeline::new(device, target_format);
         let triangle_accum = TriangleAccumPipeline::new(device);
+        let vector = VectorPathPipeline::new(device, target_format);
         let splats = SplatBuffer::new(device, &[]);
         let camera_buffer = buffers::camera_buffer(device, &CameraUniform::default());
         let convex_buffer = buffers::convex_buffer(device, &ConvexUniform::default());
@@ -110,6 +118,8 @@ impl SplatRenderer {
             layout: Layout::default(),
             resident,
             resident_capacity,
+            vector,
+            vector_scratch: Vec::new(),
         }
     }
 
@@ -256,6 +266,65 @@ impl SplatRenderer {
             &ranges,
             clear,
         );
+    }
+
+    /// Draw every `render_as_vector` stroke in `doc` as a conventional, antialiased stroked
+    /// path, composited on top of whatever is already in `view` (it **loads**, never clears).
+    /// Tessellates the stroked ribbons on the CPU each frame — vector strokes are few, clean
+    /// line art — uploads them, and issues a single mesh draw. Call *after* the splat pass
+    /// (which clears + draws the splat field) and before presenting; a document with no vector
+    /// strokes is a no-op (no pass is encoded).
+    pub fn render_vector_paths(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        doc: &Document,
+        camera: &CameraUniform,
+    ) {
+        let zoom = camera.params[0];
+        vector::tessellate_document(doc, zoom, &mut self.vector_scratch);
+        if self.vector_scratch.is_empty() {
+            return;
+        }
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        self.vector.upload(device, queue, &self.vector_scratch);
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vector bind group"),
+            layout: &self.vector.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("vector encoder"),
+        });
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("vector pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(&self.vector.pipeline);
+            rpass.set_bind_group(0, &bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.vector.buffer().slice(..));
+            rpass.draw(0..self.vector.vertex_count(), 0..1);
+        }
+        queue.submit(Some(encoder.finish()));
     }
 
     /// Drop resident scene state. Call when the document is replaced wholesale (e.g. on
