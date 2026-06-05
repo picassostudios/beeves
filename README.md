@@ -50,13 +50,16 @@ rebuilds (~1–2 s) and the browser **live-reloads automatically**. Then open th
 > (`cargo install cargo-watch`) for live reload. `npm run build` does the same auto-build
 > with an optimized (release) WASM package.
 
-Toolbar: Brush / Pen / Edit / Sculpt / Blend / Select / Pan, a color picker, a brush-size
-slider, interior-hardness + edge-hardness sliders, a crisp-perimeter toggle, and a
-blend-strength slider, plus Save/Load (`.gspf.json`).
-Single-key shortcuts: `b` brush, `p` pen, `a` edit, `s` sculpt, `l` blend, `v` select,
-`h` pan. The TypeScript shell is a thin pass-through — every edit is
-handled in Rust by `WasmApp`, which owns the document, the renderer, and the bidirectional
-sync.
+Toolbar: Brush / Pen / Edit / Sculpt / Blend / Select, a color picker, a brush-size
+slider, interior-hardness + edge-hardness sliders, a crisp-perimeter toggle, a **render-mode
+toggle (Gaussian / Convex / Triangle)** with convex-only **Sides** + **Smooth** sliders and
+triangle-only **Rotate** + **Soft** sliders, and a blend-strength slider, plus Save/Load
+(`.gspf.json`).
+Single-key shortcuts: `b` brush, `p` pen, `a` edit, `s` sculpt, `l` blend, `v` select.
+Navigation needs no tool: a trackpad two-finger swipe (or scroll wheel) pans the canvas,
+and **Shift+scroll** — or a trackpad pinch — zooms at the cursor. The TypeScript shell is a
+thin pass-through — every edit is handled in Rust by `WasmApp`, which owns the document, the
+renderer, and the bidirectional sync.
 
 **Edit (direct-selection) tool** — Illustrator-style vector editing of a stroke's Bézier
 skeleton. Click a stroke to reveal its **handles**: square anchor markers on the curve,
@@ -195,6 +198,54 @@ Both are toggleable from the browser shell (`Edge` slider + `Crisp` checkbox →
 `renderer/tests/crisp.rs` asserts the coverage path collapses a wide soft Gaussian edge to a
 thin rim.
 
+### Render modes: Gaussian, convex & triangle splatting
+
+The renderer can draw the *same* splat field with three different kernels, chosen at draw time
+by the **Mode** toggle (`set_render_mode("gaussian" | "convex" | "triangle")`):
+
+- **Gaussian** — the classic anisotropic 2D Gaussian: smooth, infinitely soft, elliptical.
+- **Convex** — a *smooth convex polygon* (the 2D analogue of
+  [3D Convex Splatting](https://convexsplatting.github.io/)): flat sides and sharp-but-AA
+  corners, which capture hard edges with far fewer primitives than round Gaussians.
+- **Triangle** — a 2D realization of [Triangle Splatting](https://trianglesplatting.github.io/)
+  (arXiv:2505.19175): each splat is a triangle whose differentiable window function
+  `I(p) = ReLU(φ(p)/φ(s))^σ` peaks at the incenter and is zero on the boundary (φ is the
+  triangle SDF built from the TRUE max of its three edge distances). σ controls solidity
+  (small σ = solid triangle, large σ = soft falloff). Like convex, it reuses the entire stack —
+  same whitened frame (so triangles inherit the splat's orientation/anisotropy and follow the
+  Bézier skeleton), same crisp-perimeter coverage path, and every tool
+  (brush/pen/edit/sculpt/blend/select) works identically.
+
+The key design point is that **the only difference between the two kernels is the level-set
+metric in the fragment shader**, so convex splatting reuses the entire stack unchanged:
+
+```
+Gaussian:  q = dᵀ Σ⁻¹ d                          (level sets are ellipses)
+Convex:    whiten d → p  (so |p|² = q),  then    (level sets are smooth K-gons)
+           ρ(p) = smooth-max_k (n_k · p)         (log-sum-exp over K half-plane normals)
+           q_convex = ρ²
+```
+
+Everything downstream is byte-identical — the EWA/Mip screen-space low-pass, the per-splat
+edge-hardness crisp remap, premultiplied-alpha output, and the two-pass coverage path. So:
+
+- the editable model (`GaussianSplat`, curve attachment, residuals) and the `GpuSplat`
+  44-byte instance layout are **untouched** — the Gaussian path is unchanged;
+- **every tool works identically in either mode** — brush, pen, edit, sculpt, **blend**,
+  select all edit the model, not the kernel;
+- mode is **orthogonal** to both the tool and the crisp toggle, giving three kernels ×
+  direct/crisp = six draw paths (Gaussian/Convex/Triangle × direct/crisp). Convex and triangle
+  each inherit the crisp-perimeter coverage path (and thus blending) for free.
+
+The polygon is defined in the splat's *whitened* frame, so it automatically inherits the
+splat's orientation and anisotropy (a thin anisotropic splat → a thin faceted polygon). The
+**Sides** slider sets `K` (3–12) and **Smooth** maps to the smooth-max sharpness δ (0 = sharp
+corners, 1 = rounded toward a circle); `corner_scale = 1/cos(π/K)` pads the instance quad so
+vertices that poke past the inscribed ellipse are not clipped. The convex shaders
+(`convex_splat.wgsl`, `convex_coverage_accum.wgsl`) carry the full derivation; the headless
+test `renderer/tests/convex.rs` asserts a square convex splat bulges toward its corners where a
+Gaussian has faded, and that the convex crisp path sharpens the perimeter like the Gaussian one.
+
 ## Crate layout
 
 ```
@@ -215,18 +266,22 @@ crates/app_core/src/        ── headless domain model (no GPU, no browser)
 crates/renderer/src/        ── wgpu/WebGPU renderer (native headless + browser surface)
   gpu.rs           context creation, offscreen target, texture readback
   camera.rs        2D pan/zoom camera + GPU uniform
-  pipelines.rs     instanced splat render pipeline (premultiplied-alpha blend)
-  coverage.rs      ★ two-pass crisp-perimeter path (accumulate coverage → resolve)
-  buffers.rs       growable splat storage buffer + camera uniform
+  pipelines.rs     instanced Gaussian splat render pipeline (premultiplied-alpha blend)
+  convex.rs        ★ convex-splat pipelines + ConvexUniform (smooth convex-polygon kernel)
+  triangle.rs      ★ triangle-splat pipelines + TriangleUniform (Triangle Splatting window function)
+  coverage.rs      ★ two-pass crisp-perimeter path (accumulate coverage → resolve), kernel-agnostic
+  buffers.rs       growable splat storage buffer + camera/convex uniforms
   picking.rs       GPU object-id pass → R32Uint id texture + readback
-  shaders/         splat.wgsl, picking.wgsl, coverage_accum.wgsl, coverage_resolve.wgsl
-  lib.rs           SplatRenderer (render_doc + render_doc_crisp) + collect_gpu_splats(&Document)
+  shaders/         splat.wgsl, convex_splat.wgsl, triangle_splat.wgsl, picking.wgsl,
+                   coverage_accum.wgsl, convex_coverage_accum.wgsl,
+                   triangle_coverage_accum.wgsl, coverage_resolve.wgsl
+  lib.rs           SplatRenderer (render_doc[_convex|_triangle][_crisp]) + collect_gpu_splats(&Document)
 
 crates/app_wasm/src/lib.rs  ── #[wasm_bindgen] WasmApp: surface + tool dispatch + sync
                                (standalone crate; built with wasm-pack → web/pkg)
 
 web/                        ── thin TypeScript / Vite shell
-  index.html       canvas + toolbar (Brush/Bézier/Sculpt/Select/Pan, color, size, save/load)
+  index.html       canvas + toolbar (Brush/Bézier/Sculpt/Select, color, size, save/load)
   src/main.ts      wasm init, rAF render loop, pointer/wheel forwarding, save/load
   src/wasm.ts      typed loader   src/tools/toolbar.ts  toolbar wiring
 ```

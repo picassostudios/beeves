@@ -13,7 +13,7 @@
 //! Everything here is deterministic and depends only on `glam` + existing `app_core`
 //! modules, mirroring the style of [`crate::solver`]'s fitter.
 
-use crate::bezier::{BezierSkeleton, CubicBezier};
+use crate::bezier::{bernstein, BezierSkeleton, CubicBezier};
 use crate::brush::BrushModel;
 use crate::document::Document;
 use crate::ids::{LayerId, StrokeId};
@@ -193,6 +193,407 @@ impl Document {
         let skeleton = fit_polyline_to_skeleton(points, tolerance);
         self.add_stroke(layer, skeleton, brush)
     }
+}
+
+// =====================================================================================
+// Adaptive-window, curvature-driven fitting
+// =====================================================================================
+//
+// An alternative to the RDP path above, used by the vector-draw tool. The idea: a single
+// cubic Bezier represents one gentle arc well, so we grow a *window* of input samples as
+// long as the stroke stays gentle, then close it and emit one cubic. The window length is
+// governed by how much the stroke *turns*:
+//
+//   * straight / gently-curving runs accumulate almost no turning  -> the window stretches
+//     far -> few anchors;
+//   * tight curves accumulate turning quickly                      -> the window closes
+//     soon -> anchors land exactly where the drawing bends.
+//
+// On top of that, true corners (a sharp local turn) are detected first and always become
+// anchors with independent tangents, so sharp features survive. Each window is fit with a
+// weighted least-squares cubic (Schneider, *Graphics Gems* 1990) using centripetal
+// parameterization and one Newton reparameterization pass, and the window is shrunk if
+// needed so the fit always stays within `tolerance`. The net effect is minimal anchors for
+// a given fidelity — fewer than RDP + the fixed `chord/3` handle heuristic.
+
+/// Tunables for [`fit_polyline_adaptive`].
+#[derive(Clone, Copy, Debug)]
+pub struct AdaptiveFitParams {
+    /// Max allowed deviation (px) of the fitted curve from the input samples. Smaller =
+    /// tighter tracking / more anchors.
+    pub tolerance: f32,
+    /// Per-window turning budget Φ_max (radians). A window closes once the stroke has bent
+    /// this much, so window length is inversely proportional to local curvature. Keeping it
+    /// below ~π also keeps each cubic in the well-conditioned "one arc" regime. ~1.6–2.1.
+    pub max_turn: f32,
+    /// Corner threshold Φ_corner (radians). A vertex whose local (wide-support) turn exceeds
+    /// this is a hard corner: it always becomes an anchor and its tangents are left
+    /// independent so the corner stays sharp. ~1.0–1.3 (≈ 60–75°).
+    pub corner_turn: f32,
+    /// Arc-length step (px) the cleaned input is resampled to before curvature analysis, so
+    /// the turning estimates don't depend on raw pointer-sampling density (which varies with
+    /// draw speed).
+    pub resample_step: f32,
+}
+
+impl Default for AdaptiveFitParams {
+    fn default() -> Self {
+        Self {
+            tolerance: 1.5,
+            max_turn: 1.9,    // ≈ 109°
+            corner_turn: 1.1, // ≈ 63°
+            resample_step: 3.0,
+        }
+    }
+}
+
+/// Fit a freehand polyline to a [`BezierSkeleton`] with a curvature-adaptive window (see the
+/// module section above). The returned skeleton has its per-anchor `corner` flags set, so
+/// the direct-edit tool treats detected corners as hard (non-mirrored) joins.
+pub fn fit_polyline_adaptive(points: &[Vec2], params: &AdaptiveFitParams) -> BezierSkeleton {
+    let cleaned = clean_input(points);
+    if cleaned.len() < 2 {
+        let p = cleaned.first().copied().unwrap_or(Vec2::ZERO);
+        return BezierSkeleton::single(straight_cubic(p, p + Vec2::new(1.0, 0.0)));
+    }
+
+    // Resample to ~uniform arc length so curvature is speed-independent.
+    let pts = resample_uniform(&cleaned, params.resample_step.max(0.5));
+    if pts.len() < 3 {
+        return BezierSkeleton::single(fit_cubic_lsq(&pts).0);
+    }
+
+    let tol = params.tolerance.max(1e-3);
+    let max_turn = params.max_turn.max(0.05);
+    let corner_turn = params.corner_turn.max(0.05);
+
+    let turn = turning_angles(&pts);
+    let corners = detect_corners(&pts, corner_turn);
+    let breakpoints = adaptive_breakpoints(&pts, &turn, &corners, max_turn, tol);
+
+    // One cubic per [bp, next-bp] window.
+    let mut segments: Vec<CubicBezier> = Vec::with_capacity(breakpoints.len().saturating_sub(1));
+    for w in breakpoints.windows(2) {
+        segments.push(fit_cubic_lsq(&pts[w[0]..=w[1]]).0);
+    }
+    if segments.is_empty() {
+        segments.push(fit_cubic_lsq(&pts).0);
+    }
+
+    // Make smooth (non-corner) interior joins visually C1, then assemble and flag corners.
+    smooth_interior_joins(&mut segments, &breakpoints, &corners);
+    let mut sk = BezierSkeleton::from_segments(segments, false);
+    for (j, &idx) in breakpoints.iter().enumerate() {
+        if let Some(meta) = sk.anchors.get_mut(j) {
+            meta.corner = corners.get(idx).copied().unwrap_or(false);
+        }
+    }
+    sk
+}
+
+impl Document {
+    /// Fit `points` with the curvature-adaptive fitter, then create a stroke on `layer`.
+    /// The vector-draw counterpart to [`Document::add_freehand_stroke`].
+    pub fn add_vector_stroke(
+        &mut self,
+        layer: LayerId,
+        points: &[Vec2],
+        brush: BrushModel,
+        params: &AdaptiveFitParams,
+    ) -> StrokeId {
+        let skeleton = fit_polyline_adaptive(points, params);
+        self.add_stroke(layer, skeleton, brush)
+    }
+}
+
+/// Resample a polyline to roughly-uniform arc-length spacing `step`, always keeping the
+/// first and last vertex. Decouples the downstream curvature estimate from the raw pointer
+/// sampling density.
+fn resample_uniform(points: &[Vec2], step: f32) -> Vec<Vec2> {
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+    let last = points[points.len() - 1];
+    let mut out = vec![points[0]];
+    let mut prev = points[0];
+    let mut acc = 0.0f32; // arc length carried since the last emitted sample
+    for &p in &points[1..] {
+        let mut seg = p - prev;
+        let mut seg_len = seg.length();
+        while acc + seg_len >= step && seg_len > 1e-9 {
+            let t = (step - acc) / seg_len;
+            let np = prev + seg * t.clamp(0.0, 1.0);
+            out.push(np);
+            prev = np;
+            seg = p - prev;
+            seg_len = seg.length();
+            acc = 0.0;
+        }
+        acc += seg_len;
+        prev = p;
+    }
+    if out.last().map_or(true, |&l| (l - last).length() > 1e-4) {
+        out.push(last);
+    }
+    out
+}
+
+/// Exterior (turning) angle at each vertex in `[0, π]`: the angle between the incoming and
+/// outgoing chord. Endpoints are 0. Only the magnitude of bending is kept — that's what the
+/// window budget and corner test consume.
+fn turning_angles(pts: &[Vec2]) -> Vec<f32> {
+    let n = pts.len();
+    let mut turn = vec![0.0f32; n];
+    for i in 1..n - 1 {
+        let a = pts[i] - pts[i - 1];
+        let b = pts[i + 1] - pts[i];
+        if a.length_squared() > 1e-12 && b.length_squared() > 1e-12 {
+            let cross = a.x * b.y - a.y * b.x;
+            turn[i] = cross.atan2(a.dot(b)).abs();
+        }
+    }
+    turn
+}
+
+/// Detect corner vertices: a ±K-sample chord angle (robust to single-step jitter) that both
+/// exceeds `corner_turn` and is a local maximum within its window (non-maximum suppression,
+/// so one physical corner yields exactly one anchor). Endpoints are never flagged — they are
+/// already anchors.
+fn detect_corners(pts: &[Vec2], corner_turn: f32) -> Vec<bool> {
+    let n = pts.len();
+    let mut is_corner = vec![false; n];
+    if n < 3 {
+        return is_corner;
+    }
+    const K: usize = 2;
+    let mut wide = vec![0.0f32; n];
+    for i in 1..n - 1 {
+        let lo = i.saturating_sub(K);
+        let hi = (i + K).min(n - 1);
+        let a = pts[i] - pts[lo];
+        let b = pts[hi] - pts[i];
+        if a.length_squared() > 1e-12 && b.length_squared() > 1e-12 {
+            wide[i] = (a.x * b.y - a.y * b.x).atan2(a.dot(b)).abs();
+        }
+    }
+    for i in 1..n - 1 {
+        if wide[i] < corner_turn {
+            continue;
+        }
+        let lo = i.saturating_sub(K);
+        let hi = (i + K).min(n - 1);
+        if (lo..=hi).all(|j| wide[j] <= wide[i] + 1e-6) {
+            is_corner[i] = true;
+        }
+    }
+    is_corner
+}
+
+/// Ordered breakpoint (anchor) indices along the resampled polyline: the two endpoints,
+/// every corner, and the adaptive interior splits. Within each smooth span a window grows
+/// while accumulated turning stays under `max_turn`, then is shrunk until a single cubic fits
+/// within `tol`.
+fn adaptive_breakpoints(
+    pts: &[Vec2],
+    turn: &[f32],
+    corners: &[bool],
+    max_turn: f32,
+    tol: f32,
+) -> Vec<usize> {
+    let n = pts.len();
+    // Hard anchors that always split the path: endpoints + corners.
+    let mut hard = vec![0usize];
+    hard.extend((1..n - 1).filter(|&i| corners[i]));
+    hard.push(n - 1);
+
+    let mut bp = vec![0usize];
+    for span in hard.windows(2) {
+        let (lo, hi) = (span[0], span[1]);
+        let mut start = lo;
+        while start < hi {
+            // 1) Grow by the turning budget (cheap; no fitting). Invariant: `acc` is the
+            //    total turning of the window's interior vertices.
+            let mut end = start + 1;
+            let mut acc = 0.0f32;
+            while end < hi && acc + turn[end] <= max_turn {
+                acc += turn[end];
+                end += 1;
+            }
+            // 2) Shrink until one cubic fits within tolerance. Progress is guaranteed: a
+            //    two-point window is a straight chord with ~zero error.
+            while end > start + 1 && fit_cubic_lsq(&pts[start..=end]).1 > tol {
+                end -= 1;
+            }
+            bp.push(end);
+            start = end;
+        }
+    }
+    bp
+}
+
+/// After fitting, rotate the two handles at each smooth (non-corner) interior anchor to be
+/// collinear through the anchor, keeping each handle's length — a visually C1 join. Corner
+/// anchors are left untouched so they stay sharp.
+fn smooth_interior_joins(segments: &mut [CubicBezier], breakpoints: &[usize], corners: &[bool]) {
+    for j in 1..segments.len() {
+        let idx = breakpoints[j];
+        if corners.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let anchor = segments[j].p0; // == segments[j - 1].p3
+        let out_dir = segments[j].p1 - anchor; // forward
+        let in_dir = segments[j - 1].p2 - anchor; // backward
+        let len_out = out_dir.length();
+        let len_in = in_dir.length();
+        // Average direction: `out` points forward, `in` points backward, so subtract.
+        let t = out_dir.normalize_or_zero() - in_dir.normalize_or_zero();
+        if t.length_squared() < 1e-12 {
+            continue;
+        }
+        let t = t.normalize();
+        segments[j].p1 = anchor + t * len_out;
+        segments[j - 1].p2 = anchor - t * len_in;
+    }
+}
+
+/// Least-squares fit of one cubic to a window of points, with fixed endpoints and
+/// data-estimated end-tangent directions (Schneider). Returns the cubic and its max
+/// at-parameter deviation. Centripetal parameterization plus one Newton reparameterization
+/// pass keep the error low so each window can stretch as far as the tolerance allows.
+fn fit_cubic_lsq(pts: &[Vec2]) -> (CubicBezier, f32) {
+    let n = pts.len();
+    // Self-defensive against degenerate windows so callers don't have to rely on upstream
+    // invariants: <2 points has no chord to fit, so synthesize a tiny straight cubic.
+    if n < 2 {
+        let p = pts.first().copied().unwrap_or(Vec2::ZERO);
+        return (straight_cubic(p, p + Vec2::new(1.0, 0.0)), 0.0);
+    }
+    let (p0, p3) = (pts[0], pts[n - 1]);
+    if n == 2 {
+        return (straight_cubic(p0, p3), 0.0);
+    }
+    let t_hat1 = start_tangent(pts);
+    let t_hat2 = end_tangent(pts);
+
+    let mut u = centripetal_params(pts);
+    let mut curve = solve_handles(pts, &u, p0, p3, t_hat1, t_hat2);
+    reparameterize(pts, &curve, &mut u);
+    curve = solve_handles(pts, &u, p0, p3, t_hat1, t_hat2);
+
+    (curve, max_error(pts, &curve, &u))
+}
+
+/// Unit tangent leaving the first point, averaged over a few early samples to damp jitter.
+fn start_tangent(pts: &[Vec2]) -> Vec2 {
+    let n = pts.len();
+    let k = (n / 4).clamp(1, 3).min(n - 1);
+    safe_dir(pts[k] - pts[0], Vec2::X)
+}
+
+/// Unit tangent arriving at the last point, pointing *backward* (toward the interior) — the
+/// convention `p2 = p3 + t_hat2 * alpha2`.
+fn end_tangent(pts: &[Vec2]) -> Vec2 {
+    let n = pts.len();
+    let k = (n / 4).clamp(1, 3).min(n - 1);
+    safe_dir(pts[n - 1 - k] - pts[n - 1], -Vec2::X)
+}
+
+fn safe_dir(v: Vec2, fallback: Vec2) -> Vec2 {
+    if v.length_squared() > 1e-12 {
+        v.normalize()
+    } else {
+        fallback
+    }
+}
+
+/// Centripetal (chord^0.5) parameterization in `[0,1]`. Reduces the overshoot/cusps that
+/// uniform and pure chord-length parameterizations produce on tight turns.
+fn centripetal_params(pts: &[Vec2]) -> Vec<f32> {
+    let n = pts.len();
+    let mut u = vec![0.0f32; n];
+    for i in 1..n {
+        u[i] = u[i - 1] + (pts[i] - pts[i - 1]).length().sqrt().max(1e-6);
+    }
+    let total = u[n - 1].max(1e-6);
+    for x in &mut u {
+        *x /= total;
+    }
+    u
+}
+
+/// Solve the two handle magnitudes (α1, α2) that minimize Σ|B(u_i) − pts_i|² with the
+/// endpoints and tangent directions fixed (Schneider's `generateBezier`). Falls back to
+/// `chord/3` handles when the normal equations are degenerate or yield a non-positive length.
+fn solve_handles(
+    pts: &[Vec2],
+    u: &[f32],
+    p0: Vec2,
+    p3: Vec2,
+    t_hat1: Vec2,
+    t_hat2: Vec2,
+) -> CubicBezier {
+    let (mut c00, mut c01, mut c11, mut x0, mut x1) = (0.0f32, 0.0, 0.0, 0.0, 0.0);
+    for (i, &p) in pts.iter().enumerate() {
+        let b = bernstein(u[i]);
+        let a1 = t_hat1 * b[1];
+        let a2 = t_hat2 * b[2];
+        c00 += a1.dot(a1);
+        c01 += a1.dot(a2);
+        c11 += a2.dot(a2);
+        // residual = point − (part fixed by the endpoints): p0·(B0+B1) + p3·(B2+B3).
+        let d = p - (p0 * (b[0] + b[1]) + p3 * (b[2] + b[3]));
+        x0 += a1.dot(d);
+        x1 += a2.dot(d);
+    }
+    let det = c00 * c11 - c01 * c01;
+    let chord = (p3 - p0).length();
+    let (alpha1, alpha2) = if det.abs() > 1e-9 {
+        ((x0 * c11 - x1 * c01) / det, (c00 * x1 - c01 * x0) / det)
+    } else {
+        (0.0, 0.0)
+    };
+    let (alpha1, alpha2) = if alpha1.is_finite()
+        && alpha2.is_finite()
+        && alpha1 > 1e-3 * chord
+        && alpha2 > 1e-3 * chord
+    {
+        (alpha1, alpha2)
+    } else {
+        (chord / 3.0, chord / 3.0)
+    };
+    CubicBezier::new(p0, p0 + t_hat1 * alpha1, p3 + t_hat2 * alpha2, p3)
+}
+
+/// Refine each sample's parameter toward the nearest point on `curve` with one Newton step
+/// of the root-find `(B(u) − p)·B'(u) = 0`.
+fn reparameterize(pts: &[Vec2], curve: &CubicBezier, u: &mut [f32]) {
+    for (i, &p) in pts.iter().enumerate() {
+        let s = u[i];
+        let q = curve.point(s);
+        let d1 = curve.velocity(s);
+        let d2 = second_derivative(curve, s);
+        let diff = q - p;
+        let denom = d1.dot(d1) + diff.dot(d2);
+        if denom.abs() > 1e-9 {
+            u[i] = (s - diff.dot(d1) / denom).clamp(0.0, 1.0);
+        }
+    }
+}
+
+/// Second derivative d²B/ds² of a cubic Bezier at `s`.
+fn second_derivative(c: &CubicBezier, s: f32) -> Vec2 {
+    let a = c.p2 - c.p1 * 2.0 + c.p0;
+    let b = c.p3 - c.p2 * 2.0 + c.p1;
+    (a * (1.0 - s) + b * s) * 6.0
+}
+
+/// Max distance between each input sample and the curve evaluated at that sample's
+/// (reparameterized) parameter.
+fn max_error(pts: &[Vec2], curve: &CubicBezier, u: &[f32]) -> f32 {
+    pts.iter()
+        .enumerate()
+        .map(|(i, &p)| (curve.point(u[i]) - p).length())
+        .fold(0.0f32, f32::max)
 }
 
 #[cfg(test)]

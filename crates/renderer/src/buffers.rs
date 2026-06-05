@@ -5,6 +5,8 @@ use wgpu::util::DeviceExt;
 use app_core::splat::GpuSplat;
 
 use crate::camera::CameraUniform;
+use crate::convex::ConvexUniform;
+use crate::triangle::TriangleUniform;
 
 /// A growable storage buffer holding the splat instances. Reallocates when the splat
 /// count exceeds capacity; otherwise updates in place via `queue.write_buffer`.
@@ -70,6 +72,26 @@ fn padded_contents(splats: &[GpuSplat], capacity: usize) -> &[u8] {
 pub fn camera_buffer(device: &wgpu::Device, uniform: &CameraUniform) -> wgpu::Buffer {
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("camera uniform"),
+        contents: bytemuck::bytes_of(uniform),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    })
+}
+
+/// A convex-shape uniform buffer (see [`ConvexUniform`]). Updated in place by
+/// `SplatRenderer::set_convex_params` via `queue.write_buffer`.
+pub fn convex_buffer(device: &wgpu::Device, uniform: &ConvexUniform) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("convex uniform"),
+        contents: bytemuck::bytes_of(uniform),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    })
+}
+
+/// A triangle-shape uniform buffer (see [`TriangleUniform`]). Updated in place by
+/// `SplatRenderer::set_triangle_params` via `queue.write_buffer`.
+pub fn triangle_buffer(device: &wgpu::Device, uniform: &TriangleUniform) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("triangle uniform"),
         contents: bytemuck::bytes_of(uniform),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     })

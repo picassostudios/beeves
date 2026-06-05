@@ -11,7 +11,7 @@
 use app_core::blend::{blend_splats, smudge_splats, BlendCarry};
 use app_core::brush::BrushModel;
 use app_core::document::Document;
-use app_core::fitting::fit_polyline_to_skeleton;
+use app_core::fitting::{fit_polyline_adaptive, fit_polyline_to_skeleton, AdaptiveFitParams};
 use app_core::selection::hit_test_splat;
 use app_core::solver::{apply_splat_edits_bidirectional, sculpt_move_splats};
 use app_core::stroke::GaussianBezierStroke;
@@ -28,6 +28,12 @@ use wasm_bindgen::prelude::*;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tool {
     Brush,
+    /// Vector-draw tool: a freehand brush whose path is fit with the curvature-adaptive
+    /// fitter (see `app_core::fitting::fit_polyline_adaptive`) — long single cubics across
+    /// straight runs, short ones across tight curves, corners preserved. While it is active
+    /// the fitted segments (one per adaptive *window*) are highlighted in red via
+    /// [`WasmApp::vector_overlay`].
+    VectorDraw,
     Bezier,
     /// Direct-edit (node) tool: select a stroke, then drag its anchors and tangent
     /// handles — Illustrator's Direct-Selection / vector tool.
@@ -38,20 +44,41 @@ enum Tool {
     /// touched, so the ellipses stay put and never collapse into larger blobs.
     Blend,
     Select,
-    Pan,
 }
 
 impl Tool {
     fn from_str(s: &str) -> Tool {
         match s {
+            "vectordraw" => Tool::VectorDraw,
             "bezier" => Tool::Bezier,
             "edit" => Tool::Edit,
             "sculpt" => Tool::Sculpt,
             "blend" => Tool::Blend,
             "select" => Tool::Select,
-            "pan" => Tool::Pan,
             // "brush" and any unknown value default to the brush.
             _ => Tool::Brush,
+        }
+    }
+}
+
+/// Which kernel the renderer draws splats with. This is *orthogonal* to the active tool and to
+/// `crisp_edges`: every tool (brush/pen/edit/sculpt/blend/select) edits the same model and
+/// works identically in either mode — the choice only changes the per-splat footprint at draw
+/// time (elliptical Gaussian vs smooth convex polygon vs triangle splat).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderMode {
+    Gaussian,
+    Convex,
+    Triangle,
+}
+
+impl RenderMode {
+    fn from_str(s: &str) -> RenderMode {
+        match s {
+            "convex" => RenderMode::Convex,
+            "triangle" => RenderMode::Triangle,
+            // "gaussian" and any unknown value default to the Gaussian kernel.
+            _ => RenderMode::Gaussian,
         }
     }
 }
@@ -130,6 +157,11 @@ pub struct WasmApp {
     pointer: PointerState,
     pen: PenState,
     edit: EditState,
+    /// Stroke whose adaptive-window decomposition the vector-draw overlay highlights in red.
+    /// Points at the live preview while drawing and at the just-committed stroke afterwards,
+    /// so the windows stay visible for inspection while the tool is selected. Read by
+    /// [`WasmApp::vector_overlay`]; reset when a new vector stroke begins.
+    vector_viz: Option<StrokeId>,
     /// Live keyboard-modifier state, pushed from JS via `set_modifiers` before each
     /// pointer event. `alt` breaks a smooth handle's tangent while dragging.
     mod_alt: bool,
@@ -151,6 +183,23 @@ pub struct WasmApp {
     /// perimeters are a single crisp antialiased edge with a fuzzy interior; when false,
     /// use the direct per-splat path (`render_doc`). Toggled from JS via `set_crisp_edges`.
     crisp_edges: bool,
+    /// Which kernel the renderer draws with (Gaussian vs convex polygon). Orthogonal to the
+    /// tool and to `crisp_edges`, giving four draw paths total. Toggled via `set_render_mode`.
+    render_mode: RenderMode,
+    /// Convex hull side count (3..=8). Only affects `RenderMode::Convex`.
+    convex_sides: f32,
+    /// Convex corner smoothness in `[0,1]`: 0 = sharp polygon corners, 1 = rounded toward a
+    /// circle. Mapped to the 3DCS smoothness δ by [`convex_delta`].
+    convex_smoothness: f32,
+    /// Convex edge sharpness in `[0,1]`: 0 = diffuse boundary, 1 = dense/crisp edge. Mapped to
+    /// the 3DCS sharpness σ by [`convex_sigma`].
+    convex_sharpness: f32,
+    /// Triangle splat UI rotation in `[0,1]` (0 = apex up). Only affects `RenderMode::Triangle`.
+    /// Mapped to radians by [`triangle_rotation_radians`].
+    tri_rotation: f32,
+    /// Triangle splat UI window smoothness in `[0,1]`: 0 = a solid, hard-edged triangle, 1 =
+    /// soft/peaked falloff. Maps to the Triangle Splatting paper's σ by [`triangle_sigma`].
+    tri_softness: f32,
 }
 
 #[wasm_bindgen]
@@ -223,6 +272,28 @@ impl WasmApp {
 
         let splat_renderer = SplatRenderer::new(&gpu.device, format);
 
+        // Convex-mode defaults: a crisp hexagon (sharp-ish corners, dense edge). Seed the
+        // renderer's convex uniform now so the convex paths are ready the moment modes switch.
+        let convex_sides = 6.0_f32;
+        let convex_smoothness = 0.2_f32;
+        let convex_sharpness = 0.85_f32;
+        splat_renderer.set_convex_params(
+            &gpu.queue,
+            convex_sides,
+            convex_delta(convex_smoothness),
+            convex_sigma(convex_sharpness),
+        );
+
+        // Triangle-mode defaults: apex-up with a slightly soft window. Seed the renderer's
+        // triangle uniform now so the triangle paths are ready the moment modes switch.
+        let tri_rotation = 0.0_f32;
+        let tri_softness = 0.25_f32;
+        splat_renderer.set_triangle_params(
+            &gpu.queue,
+            triangle_rotation_radians(tri_rotation),
+            triangle_sigma(tri_softness),
+        );
+
         let mut doc = Document::new();
         let layer = doc.add_layer("Layer 1");
 
@@ -240,6 +311,7 @@ impl WasmApp {
             pointer: PointerState::default(),
             pen: PenState::default(),
             edit: EditState::default(),
+            vector_viz: None,
             mod_alt: false,
             mod_shift: false,
             brush_color: [0.1, 0.2, 0.9, 1.0],
@@ -249,6 +321,12 @@ impl WasmApp {
             blend_strength: 0.5,
             blend_carry: BlendCarry::default(),
             crisp_edges: true,
+            render_mode: RenderMode::Gaussian,
+            convex_sides,
+            convex_smoothness,
+            convex_sharpness,
+            tri_rotation,
+            tri_softness,
         })
     }
 
@@ -297,36 +375,39 @@ impl WasmApp {
             a: bg[3] as f64,
         };
 
-        // Incremental, resident render: both paths reconcile the GPU buffer against the
+        // Incremental, resident render: every path reconciles the GPU buffer against the
         // document (uploading only new/edited strokes via the per-stroke dirty flags) and
-        // draw only the view-visible stroke ranges. A camera-only frame uploads no splats.
-        // `render_doc_crisp` adds the two-pass coverage path for crisp line perimeters;
-        // `render_doc` is the direct per-splat path.
+        // draws only the view-visible stroke ranges. A camera-only frame uploads no splats.
+        // Two orthogonal toggles pick the path: `render_mode` (Gaussian vs convex kernel) and
+        // `crisp_edges` (direct per-splat vs the two-pass coverage path for crisp perimeters),
+        // giving four combinations — convex inherits the crisp path (and thus blending) for free.
         let camera = self.camera.uniform();
-        if self.crisp_edges {
-            self.splat_renderer.render_doc_crisp(
-                &self.gpu.device,
-                &self.gpu.queue,
-                &view,
-                &mut self.doc,
-                &camera,
-                view_min,
-                view_max,
-                self.config.width,
-                self.config.height,
-                clear,
-            );
-        } else {
-            self.splat_renderer.render_doc(
-                &self.gpu.device,
-                &self.gpu.queue,
-                &view,
-                &mut self.doc,
-                &camera,
-                view_min,
-                view_max,
-                clear,
-            );
+        let (w, h) = (self.config.width, self.config.height);
+        match (self.render_mode, self.crisp_edges) {
+            (RenderMode::Gaussian, false) => self.splat_renderer.render_doc(
+                &self.gpu.device, &self.gpu.queue, &view, &mut self.doc, &camera, view_min,
+                view_max, clear,
+            ),
+            (RenderMode::Gaussian, true) => self.splat_renderer.render_doc_crisp(
+                &self.gpu.device, &self.gpu.queue, &view, &mut self.doc, &camera, view_min,
+                view_max, w, h, clear,
+            ),
+            (RenderMode::Convex, false) => self.splat_renderer.render_doc_convex(
+                &self.gpu.device, &self.gpu.queue, &view, &mut self.doc, &camera, view_min,
+                view_max, clear,
+            ),
+            (RenderMode::Convex, true) => self.splat_renderer.render_doc_convex_crisp(
+                &self.gpu.device, &self.gpu.queue, &view, &mut self.doc, &camera, view_min,
+                view_max, w, h, clear,
+            ),
+            (RenderMode::Triangle, false) => self.splat_renderer.render_doc_triangle(
+                &self.gpu.device, &self.gpu.queue, &view, &mut self.doc, &camera, view_min,
+                view_max, clear,
+            ),
+            (RenderMode::Triangle, true) => self.splat_renderer.render_doc_triangle_crisp(
+                &self.gpu.device, &self.gpu.queue, &view, &mut self.doc, &camera, view_min,
+                view_max, w, h, clear,
+            ),
         }
 
         frame.present();
@@ -346,6 +427,12 @@ impl WasmApp {
 
         match self.tool {
             Tool::Brush => {
+                self.pointer.polyline.push(world);
+            }
+            Tool::VectorDraw => {
+                // Same freehand capture as the brush; the fitter differs (see pointer_move).
+                // Clear the previous stroke's window highlight so a new gesture starts clean.
+                self.vector_viz = None;
                 self.pointer.polyline.push(world);
             }
             Tool::Sculpt => {
@@ -410,7 +497,6 @@ impl WasmApp {
                     self.doc.selection.splats.push((hit.stroke, hit.splat));
                 }
             }
-            Tool::Pan => {}
         }
     }
 
@@ -429,6 +515,12 @@ impl WasmApp {
                 // Live preview: refit the in-progress polyline and update the preview
                 // stroke so it tracks the cursor as the user draws.
                 self.brush_rebuild_preview();
+            }
+            Tool::VectorDraw => {
+                self.pointer.polyline.push(world);
+                // Live preview with the curvature-adaptive fitter; also refreshes the red
+                // window overlay (vector_viz) so anchors appear/dissolve as the path bends.
+                self.vector_rebuild_preview();
             }
             Tool::Sculpt => {
                 let delta_world = world - self.camera.screen_to_world(prev_screen);
@@ -465,10 +557,6 @@ impl WasmApp {
                     }
                 }
             }
-            Tool::Pan => {
-                let delta_px = screen - prev_screen;
-                self.camera.pan_pixels(delta_px);
-            }
             Tool::Select => {}
         }
 
@@ -498,6 +586,22 @@ impl WasmApp {
             }
         }
 
+        if self.tool == Tool::VectorDraw {
+            if self.pointer.polyline.last() != Some(&world) {
+                self.pointer.polyline.push(world);
+            }
+            if self.pointer.polyline.len() >= 2 {
+                self.vector_rebuild_preview();
+                // Keep the committed stroke; keep pointing the red overlay at it so its
+                // adaptive windows stay visible after release. Drop only our preview handle.
+                self.vector_viz = self.pointer.preview;
+                self.pointer.preview = None;
+            } else {
+                self.brush_discard_preview();
+                self.vector_viz = None;
+            }
+        }
+
         // Releasing ends the handle drag but keeps the pen path open for more anchors.
         if self.tool == Tool::Bezier {
             self.pen.dragging_handle = false;
@@ -515,11 +619,21 @@ impl WasmApp {
     }
 
     /// Zoom centered at screen `(x, y)`. `delta` is a wheel delta: positive zooms in.
+    /// The shell routes zoom here only for Shift+scroll (and trackpad pinch); a plain
+    /// scroll/two-finger swipe pans via [`WasmApp::pan`] instead.
     pub fn wheel(&mut self, x: f32, y: f32, delta: f32) {
         // Map the wheel delta to a multiplicative zoom factor. A typical wheel notch is
         // ~+/-100; exp keeps zooming symmetric and smooth.
         let factor = (delta * 0.0015).exp();
         self.camera.zoom_at(Vec2::new(x, y), factor);
+    }
+
+    /// Pan the view by a screen-pixel delta from a trackpad two-finger swipe (or scroll
+    /// wheel). Positive `dx`/`dy` move the viewport right/down across the document, so the
+    /// canvas tracks the swipe the way scrolling moves a page. This replaces the old Pan
+    /// tool for everyday navigation — panning no longer needs a tool to be selected.
+    pub fn pan(&mut self, dx: f32, dy: f32) {
+        self.camera.pan_pixels(Vec2::new(-dx, -dy));
     }
 
     /// Set the active tool. Unknown strings fall back to the brush.
@@ -628,6 +742,60 @@ impl WasmApp {
         out
     }
 
+    /// Geometry that visualizes the vector-draw tool's adaptive windows, in **device-pixel
+    /// screen space**, as a flat `f32` array (a JS `Float32Array`). Each fitted segment is one
+    /// adaptive window: long/sparse across straight runs, short/dense across tight curves. The
+    /// JS overlay (`drawVectorOverlay`) paints every segment red and every anchor as a marker
+    /// (a corner anchor as a filled diamond, a smooth one as a hollow square); the **last**
+    /// segment is the window still being grown, drawn brightest. Empty when no vector stroke is
+    /// being shown.
+    ///
+    /// Layout:
+    /// ```text
+    /// [ seg_count,
+    ///   // repeated seg_count times — one polyline per segment:
+    ///   pt_count, x0, y0, x1, y1, ...,
+    ///   // then anchors:
+    ///   anchor_count, ax0, ay0, is_corner0, ax1, ay1, is_corner1, ... ]
+    /// ```
+    /// `is_corner` is `1.0` for a hard corner (independent tangents) or `0.0` for a smooth join.
+    pub fn vector_overlay(&self) -> Vec<f32> {
+        let mut out = Vec::new();
+        let Some(sid) = self.vector_viz else {
+            return out;
+        };
+        let Some(stroke) = self.doc.stroke(sid) else {
+            return out;
+        };
+        let sk = &stroke.skeleton;
+        if sk.segments.is_empty() {
+            return out;
+        }
+
+        const STEPS: usize = 16;
+        out.push(sk.segments.len() as f32);
+        for seg in &sk.segments {
+            out.push((STEPS + 1) as f32);
+            for k in 0..=STEPS {
+                let s = k as f32 / STEPS as f32;
+                let p = self.camera.world_to_screen(seg.point(s));
+                out.push(p.x);
+                out.push(p.y);
+            }
+        }
+
+        let n = sk.anchor_count();
+        out.push(n as f32);
+        for j in 0..n {
+            let a = self.camera.world_to_screen(sk.anchor_position(j));
+            out.push(a.x);
+            out.push(a.y);
+            let is_corner = sk.anchors.get(j).map(|m| m.corner).unwrap_or(false);
+            out.push(if is_corner { 1.0 } else { 0.0 });
+        }
+        out
+    }
+
     /// Set the brush color (linear RGB, alpha preserved from the current brush).
     ///
     /// In the direct-edit (node) tool, this doubles as a "recolour the selected path"
@@ -678,9 +846,63 @@ impl WasmApp {
     }
 
     /// Toggle the crisp-perimeter render path. When on, lines are drawn through the two-pass
-    /// coverage path so the silhouette is one crisp antialiased edge.
+    /// coverage path so the silhouette is one crisp antialiased edge. Works in both render
+    /// modes (Gaussian and convex).
     pub fn set_crisp_edges(&mut self, enabled: bool) {
         self.crisp_edges = enabled;
+    }
+
+    /// Switch the render kernel: `"gaussian"` (anisotropic Gaussian splats, the default),
+    /// `"convex"` (smooth convex-polygon splats), or `"triangle"` (triangle splats). Orthogonal
+    /// to the active tool and to the crisp-edges toggle — the document and every tool
+    /// (brush/pen/edit/sculpt/blend/select) are untouched; only the per-splat footprint drawn
+    /// each frame changes. Unknown strings fall back to Gaussian.
+    pub fn set_render_mode(&mut self, mode: &str) {
+        self.render_mode = RenderMode::from_str(mode);
+    }
+
+    /// The active render mode as the same string contract `set_render_mode` accepts.
+    pub fn render_mode(&self) -> String {
+        match self.render_mode {
+            RenderMode::Gaussian => "gaussian".to_string(),
+            RenderMode::Convex => "convex".to_string(),
+            RenderMode::Triangle => "triangle".to_string(),
+        }
+    }
+
+    /// Set the convex hull's side count, clamped to `3..=8` (matching the shader). Affects only
+    /// convex mode; pushes the new shape to the GPU immediately.
+    pub fn set_convex_sides(&mut self, sides: f32) {
+        self.convex_sides = sides.clamp(3.0, 8.0);
+        self.push_convex_params();
+    }
+
+    /// Set the convex *corner* smoothness in `[0,1]` (3DCS δ): 0 = sharp polygon corners, 1 =
+    /// rounded toward a circle. Affects only convex mode; pushes the new shape immediately.
+    pub fn set_convex_smoothness(&mut self, smoothness: f32) {
+        self.convex_smoothness = smoothness.clamp(0.0, 1.0);
+        self.push_convex_params();
+    }
+
+    /// Set the convex *edge* sharpness in `[0,1]` (3DCS σ): 0 = diffuse boundary, 1 = a dense,
+    /// hard edge (the crisp, low-primitive-count regime convex splatting is for). Affects only
+    /// convex mode; pushes the new shape immediately.
+    pub fn set_convex_sharpness(&mut self, sharpness: f32) {
+        self.convex_sharpness = sharpness.clamp(0.0, 1.0);
+        self.push_convex_params();
+    }
+
+    /// Set the triangle orientation in `[0,1]` (0 = apex up, 1 = full turn). Triangle mode only.
+    pub fn set_triangle_rotation(&mut self, rotation: f32) {
+        self.tri_rotation = rotation.clamp(0.0, 1.0);
+        self.push_triangle_params();
+    }
+
+    /// Set the triangle window smoothness in `[0,1]` (Triangle Splatting σ): 0 = a solid, hard-
+    /// edged triangle, 1 = a soft falloff peaking at the incenter. Triangle mode only.
+    pub fn set_triangle_softness(&mut self, softness: f32) {
+        self.tri_softness = softness.clamp(0.0, 1.0);
+        self.push_triangle_params();
     }
 
     /// Set the blend (smudge) tool strength in `[0,1]`: the fraction toward the local
@@ -749,6 +971,26 @@ impl WasmApp {
 
 // --- Internal helpers (not exported to JS) ---
 impl WasmApp {
+    /// Push the current convex shape parameters to the renderer's convex uniform. Cheap (one
+    /// small `write_buffer`); called only when a convex control changes.
+    fn push_convex_params(&self) {
+        self.splat_renderer.set_convex_params(
+            &self.gpu.queue,
+            self.convex_sides,
+            convex_delta(self.convex_smoothness),
+            convex_sigma(self.convex_sharpness),
+        );
+    }
+
+    /// Push the current triangle shape parameters to the renderer's triangle uniform.
+    fn push_triangle_params(&self) {
+        self.splat_renderer.set_triangle_params(
+            &self.gpu.queue,
+            triangle_rotation_radians(self.tri_rotation),
+            triangle_sigma(self.tri_softness),
+        );
+    }
+
     /// Build a `BrushModel` from the current brush parameters.
     fn current_brush(&self) -> BrushModel {
         BrushModel {
@@ -767,6 +1009,18 @@ impl WasmApp {
         fit_polyline_to_skeleton(points, tolerance)
     }
 
+    /// Fit `points` (world coords) with the curvature-adaptive fitter. Tolerance and the
+    /// resample step are zoom-aware (held at a roughly constant size on screen) so the same
+    /// gesture yields the same anchor density regardless of zoom level.
+    fn fit_vector_skeleton(&self, points: &[Vec2]) -> BezierSkeleton {
+        let params = AdaptiveFitParams {
+            tolerance: (1.5 / self.camera.zoom).max(0.25),
+            resample_step: (3.0 / self.camera.zoom).max(0.75),
+            ..AdaptiveFitParams::default()
+        };
+        fit_polyline_adaptive(points, &params)
+    }
+
     /// Fit `points` (world coords) to a skeleton and add a stroke on the current layer.
     fn add_brush_stroke(&mut self, points: &[Vec2]) -> StrokeId {
         let skeleton = self.fit_brush_skeleton(points);
@@ -783,6 +1037,27 @@ impl WasmApp {
             return;
         }
         let skeleton = self.fit_brush_skeleton(&self.pointer.polyline);
+        self.set_preview_stroke(skeleton);
+    }
+
+    /// Rebuild (or create) the vector-draw tool's live preview from the in-progress polyline
+    /// using the curvature-adaptive fitter, and point the red window overlay at it. Mirrors
+    /// [`Self::brush_rebuild_preview`] but with the adaptive fitter.
+    fn vector_rebuild_preview(&mut self) {
+        if self.pointer.polyline.len() < 2 {
+            self.brush_discard_preview();
+            self.vector_viz = None;
+            return;
+        }
+        let skeleton = self.fit_vector_skeleton(&self.pointer.polyline);
+        self.set_preview_stroke(skeleton);
+        self.vector_viz = self.pointer.preview;
+    }
+
+    /// Update the active preview stroke (`pointer.preview`) to `skeleton` with the current
+    /// brush, creating it on the current layer if it does not exist yet. Shared by the brush
+    /// and vector-draw live previews.
+    fn set_preview_stroke(&mut self, skeleton: BezierSkeleton) {
         let brush = self.current_brush();
         match self.pointer.preview {
             Some(sid) if self.doc.stroke(sid).is_some() => {
@@ -941,6 +1216,30 @@ impl WasmApp {
             .position(|k| k == sid)
             .map(|i| i as u32)
     }
+}
+
+/// Map the UI corner-smoothness slider `[0,1]` to the 3DCS smoothness δ: 0 → sharp polygon
+/// corners (high δ, φ ≈ the exact hull signed distance), 1 → softly rounded vertices (low δ).
+fn convex_delta(smoothness: f32) -> f32 {
+    28.0 - 25.0 * smoothness.clamp(0.0, 1.0)
+}
+
+/// Map the UI edge-sharpness slider `[0,1]` to the 3DCS sharpness σ: 0 → a diffuse boundary
+/// (low σ), 1 → a dense, crisp edge (high σ; the shader caps the on-screen transition to ~1px
+/// so it antialiases rather than aliasing). [`renderer::ConvexUniform`] clamps σ to a safe range.
+fn convex_sigma(sharpness: f32) -> f32 {
+    3.0 + 57.0 * sharpness.clamp(0.0, 1.0)
+}
+
+/// Map the UI rotation slider `[0,1]` to radians `[0, 2π)`.
+fn triangle_rotation_radians(rotation: f32) -> f32 {
+    rotation.clamp(0.0, 1.0) * std::f32::consts::TAU
+}
+
+/// Map the UI softness slider `[0,1]` to the Triangle Splatting smoothness σ: 0 → a near-solid
+/// triangle (small σ, hard top-hat window), 1 → a soft falloff peaking at the incenter (large σ).
+fn triangle_sigma(softness: f32) -> f32 {
+    0.06 + 2.4 * softness.clamp(0.0, 1.0).powf(1.4)
 }
 
 /// Build a Bezier skeleton from pen anchors. Each consecutive pair becomes one cubic:

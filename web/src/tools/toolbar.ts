@@ -8,21 +8,21 @@
 
 export type ToolName =
   | "brush"
+  | "vectordraw"
   | "bezier"
   | "edit"
   | "sculpt"
   | "blend"
-  | "select"
-  | "pan";
+  | "select";
 
 export const TOOLS: readonly ToolName[] = [
   "brush",
+  "vectordraw",
   "bezier",
   "edit",
   "sculpt",
   "blend",
   "select",
-  "pan",
 ] as const;
 
 function isToolName(value: string): value is ToolName {

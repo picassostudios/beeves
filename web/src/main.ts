@@ -5,7 +5,11 @@
  */
 import { createApp, type WasmApp } from "./wasm";
 import { createToolbar, type ToolName } from "./tools/toolbar";
-import { drawEditOverlay, clearEditOverlay } from "./tools/handles";
+import {
+  drawEditOverlay,
+  clearEditOverlay,
+  drawVectorOverlay,
+} from "./tools/handles";
 
 /** Resolve a required element by id or throw (keeps the wiring honest). */
 function mustGet<T extends HTMLElement>(id: string): T {
@@ -168,6 +172,79 @@ async function boot(): Promise<void> {
   crispInput.addEventListener("change", applyCrisp);
   applyCrisp();
 
+  // --- Render mode (Gaussian / Convex) -------------------------------------
+  // Orthogonal to the active tool and to the crisp toggle: switching the kernel never touches
+  // the document, so every tool — including Blend — works the same in either mode. The convex
+  // shape controls are only meaningful in convex mode, so they are shown/hidden with it.
+  const modeButtons = Array.from(
+    mustGet<HTMLDivElement>("modes").querySelectorAll<HTMLButtonElement>(
+      "button[data-mode]"
+    )
+  );
+  const convexControls = mustGet<HTMLDivElement>("convex-controls");
+  const triangleControls = mustGet<HTMLDivElement>("triangle-controls");
+  const selectMode = (mode: string): void => {
+    app.set_render_mode(mode);
+    for (const b of modeButtons) {
+      const isActive = b.dataset.mode === mode;
+      b.classList.toggle("is-active", isActive);
+      b.setAttribute("aria-pressed", String(isActive));
+    }
+    convexControls.hidden = mode !== "convex";
+    triangleControls.hidden = mode !== "triangle";
+  };
+  for (const b of modeButtons) {
+    b.addEventListener("click", () => selectMode(b.dataset.mode ?? "gaussian"));
+  }
+  selectMode("gaussian");
+
+  // --- Convex shape: sides + corner smoothness -----------------------------
+  const sidesInput = mustGet<HTMLInputElement>("convex-sides");
+  const sidesValue = mustGet<HTMLSpanElement>("convex-sides-value");
+  const applySides = (): void => {
+    sidesValue.textContent = sidesInput.value;
+    app.set_convex_sides(Number(sidesInput.value));
+  };
+  sidesInput.addEventListener("input", applySides);
+  applySides();
+
+  const smoothInput = mustGet<HTMLInputElement>("convex-smoothness");
+  const smoothValue = mustGet<HTMLSpanElement>("convex-smoothness-value");
+  const applySmooth = (): void => {
+    smoothValue.textContent = Number(smoothInput.value).toFixed(2);
+    app.set_convex_smoothness(Number(smoothInput.value));
+  };
+  smoothInput.addEventListener("input", applySmooth);
+  applySmooth();
+
+  const sharpInput = mustGet<HTMLInputElement>("convex-sharpness");
+  const sharpValue = mustGet<HTMLSpanElement>("convex-sharpness-value");
+  const applySharp = (): void => {
+    sharpValue.textContent = Number(sharpInput.value).toFixed(2);
+    app.set_convex_sharpness(Number(sharpInput.value));
+  };
+  sharpInput.addEventListener("input", applySharp);
+  applySharp();
+
+  // --- Triangle shape: rotation + window softness ---------------------------
+  const triRotInput = mustGet<HTMLInputElement>("triangle-rotation");
+  const triRotValue = mustGet<HTMLSpanElement>("triangle-rotation-value");
+  const applyTriRot = (): void => {
+    triRotValue.textContent = Number(triRotInput.value).toFixed(2);
+    app.set_triangle_rotation(Number(triRotInput.value));
+  };
+  triRotInput.addEventListener("input", applyTriRot);
+  applyTriRot();
+
+  const triSoftInput = mustGet<HTMLInputElement>("triangle-softness");
+  const triSoftValue = mustGet<HTMLSpanElement>("triangle-softness-value");
+  const applyTriSoft = (): void => {
+    triSoftValue.textContent = Number(triSoftInput.value).toFixed(2);
+    app.set_triangle_softness(Number(triSoftInput.value));
+  };
+  triSoftInput.addEventListener("input", applyTriSoft);
+  applyTriSoft();
+
   // --- Blend strength -------------------------------------------------------
   const blendInput = mustGet<HTMLInputElement>("blend-strength");
   const blendValue = mustGet<HTMLSpanElement>("blend-strength-value");
@@ -236,13 +313,27 @@ async function boot(): Promise<void> {
   canvas.addEventListener("pointerup", endPointer);
   canvas.addEventListener("pointercancel", endPointer);
 
-  // --- Wheel (zoom at cursor) ----------------------------------------------
+  // --- Wheel (trackpad pan; Shift/pinch to zoom) ---------------------------
+  // A plain two-finger swipe (or scroll wheel) pans the canvas — no Pan tool needed.
+  // Hold Shift while scrolling to zoom at the cursor; a trackpad pinch (which the
+  // browser reports as a wheel event with ctrlKey) zooms too.
   canvas.addEventListener(
     "wheel",
     (ev: WheelEvent) => {
       ev.preventDefault();
       const [x, y] = eventCoords(canvas, ev);
-      app.wheel(x, y, ev.deltaY);
+      if (ev.shiftKey || ev.ctrlKey) {
+        // Zoom: use whichever axis carries the gesture — browsers route Shift+wheel
+        // to deltaX on some platforms, and pinch comes through deltaY.
+        const dz =
+          Math.abs(ev.deltaY) >= Math.abs(ev.deltaX) ? ev.deltaY : ev.deltaX;
+        app.wheel(x, y, dz);
+      } else {
+        // Pan: wheel deltas are in CSS pixels; scale by DPR to match the device-pixel
+        // coordinate space the camera works in.
+        const dpr = window.devicePixelRatio || 1;
+        app.pan(ev.deltaX * dpr, ev.deltaY * dpr);
+      }
     },
     { passive: false }
   );
@@ -260,12 +351,12 @@ async function boot(): Promise<void> {
   // Single-key tool shortcuts (skipped while typing in a form control).
   const TOOL_KEYS: Record<string, ToolName> = {
     b: "brush",
+    d: "vectordraw",
     p: "bezier",
     a: "edit",
     s: "sculpt",
     l: "blend",
     v: "select",
-    h: "pan",
   };
   window.addEventListener("keydown", (ev: KeyboardEvent) => {
     if (ev.key === "Enter") {
@@ -310,6 +401,10 @@ async function boot(): Promise<void> {
     if (currentTool === "edit") {
       const dpr = window.devicePixelRatio || 1;
       drawEditOverlay(overlayCtx, app.edit_overlay(), dpr);
+      overlayShown = true;
+    } else if (currentTool === "vectordraw") {
+      const dpr = window.devicePixelRatio || 1;
+      drawVectorOverlay(overlayCtx, app.vector_overlay(), dpr);
       overlayShown = true;
     } else if (overlayShown) {
       clearEditOverlay(overlayCtx);

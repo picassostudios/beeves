@@ -58,7 +58,10 @@ automatically; only standalone `typecheck` needs it built first.
 - **Sculpt** — drag to push splats on the nearest stroke (uses the Size
   slider as the sculpt radius).
 - **Select** — click to hit-test/select a splat.
-- **Pan** — drag to pan the camera. The mouse wheel zooms at the cursor.
+
+**Navigating** needs no tool: a trackpad two-finger swipe (or a scroll wheel)
+pans the canvas, and **Shift+scroll** — or a trackpad pinch — zooms at the
+cursor.
 
 Use the color swatch and size slider to set brush parameters. **Save**
 downloads the document as `*.gspf.json`; **Load** reads one back in. The

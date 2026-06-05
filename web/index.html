@@ -111,7 +111,12 @@
       }
 
       #brush-size-value,
-      #brush-hardness-value {
+      #brush-hardness-value,
+      #convex-sides-value,
+      #convex-smoothness-value,
+      #convex-sharpness-value,
+      #triangle-rotation-value,
+      #triangle-softness-value {
         min-width: 2.5ch;
         text-align: right;
         color: var(--fg);
@@ -194,12 +199,12 @@
       <div id="toolbar">
         <div class="tools" id="tools">
           <button type="button" data-tool="brush" title="Brush">Brush</button>
+          <button type="button" data-tool="vectordraw" title="Vector Draw — adaptive curvature fit (D)">Vector</button>
           <button type="button" data-tool="bezier" title="Pen — place anchors, drag for curves">Pen</button>
           <button type="button" data-tool="edit" title="Edit anchors &amp; handles (A)">Edit</button>
           <button type="button" data-tool="sculpt" title="Sculpt">Sculpt</button>
           <button type="button" data-tool="blend" title="Blend — smudge neighbouring gaussians' colours into each other (L)">Blend</button>
           <button type="button" data-tool="select" title="Select">Select</button>
-          <button type="button" data-tool="pan" title="Pan">Pan</button>
         </div>
 
         <div class="sep"></div>
@@ -231,6 +236,44 @@
           <label for="crisp-edges">Crisp</label>
           <input type="checkbox" id="crisp-edges" checked />
         </div>
+
+        <div class="sep"></div>
+
+        <div class="group">
+          <label>Mode</label>
+          <div class="tools" id="modes">
+            <button type="button" data-mode="gaussian" title="Gaussian splats (elliptical kernel)">Gaussian</button>
+            <button type="button" data-mode="convex" title="Convex-polygon splats (flat sides, sharp corners)">Convex</button>
+            <button type="button" data-mode="triangle" title="Triangle splats (Triangle Splatting — directional, follows the stroke)">Triangle</button>
+          </div>
+        </div>
+
+        <!-- Convex-only shape controls; hidden in Gaussian mode (toggled in main.ts).
+             Sides = K (hull point count); Smooth = δ corner rounding; Sharp = σ edge density. -->
+        <div class="group" id="convex-controls" hidden>
+          <label for="convex-sides">Sides</label>
+          <input type="range" id="convex-sides" min="3" max="8" step="1" value="6" />
+          <span id="convex-sides-value">6</span>
+          <label for="convex-smoothness" title="Corner rounding (3DCS δ)">Smooth</label>
+          <input type="range" id="convex-smoothness" min="0" max="1" step="0.05" value="0.2" />
+          <span id="convex-smoothness-value">0.20</span>
+          <label for="convex-sharpness" title="Edge sharpness (3DCS σ)">Sharp</label>
+          <input type="range" id="convex-sharpness" min="0" max="1" step="0.05" value="0.85" />
+          <span id="convex-sharpness-value">0.85</span>
+        </div>
+
+        <!-- Triangle-only shape controls; hidden unless in Triangle mode (toggled in main.ts).
+             Rotate = triangle orientation; Soft = window smoothness σ (0 = solid, 1 = soft falloff). -->
+        <div class="group" id="triangle-controls" hidden>
+          <label for="triangle-rotation" title="Triangle orientation">Rotate</label>
+          <input type="range" id="triangle-rotation" min="0" max="1" step="0.02" value="0" />
+          <span id="triangle-rotation-value">0.00</span>
+          <label for="triangle-softness" title="Window smoothness (Triangle Splatting σ)">Soft</label>
+          <input type="range" id="triangle-softness" min="0" max="1" step="0.05" value="0.25" />
+          <span id="triangle-softness-value">0.25</span>
+        </div>
+
+        <div class="sep"></div>
 
         <div class="group">
           <label for="blend-strength">Blend</label>

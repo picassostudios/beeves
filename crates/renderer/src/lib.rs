@@ -7,20 +7,26 @@
 
 pub mod buffers;
 pub mod camera;
+pub mod convex;
 pub mod coverage;
 pub mod gpu;
 pub mod picking;
 pub mod pipelines;
 pub mod scene;
+pub mod triangle;
 
 pub use camera::{Camera2D, CameraUniform};
+pub use convex::ConvexUniform;
 pub use gpu::GpuContext;
 pub use scene::SceneLayout;
+pub use triangle::TriangleUniform;
 
 use app_core::document::Document;
 use app_core::splat::GpuSplat;
 use buffers::SplatBuffer;
+use convex::{ConvexAccumPipeline, ConvexSplatPipeline};
 use pipelines::SplatPipeline;
+use triangle::{TriangleAccumPipeline, TriangleSplatPipeline};
 use scene::SceneLayout as Layout;
 
 /// Initial resident-buffer capacity (in splats). Sized so a handful of strokes fit before
@@ -45,9 +51,27 @@ fn create_resident_buffer(device: &wgpu::Device, cap_splats: usize) -> wgpu::Buf
 /// headless shader tests.
 pub struct SplatRenderer {
     pipeline: SplatPipeline,
+    /// Convex-splat twin of `pipeline` (smooth convex-polygon kernel). Selected per-frame by
+    /// the `render_doc_convex*` paths; shares the resident buffer + camera uniform.
+    convex: ConvexSplatPipeline,
     /// Two-pass crisp-perimeter path (accumulate coverage + resolve). Owns its own offscreen
-    /// targets; see [`coverage`].
+    /// targets; see [`coverage`]. The resolve pass is mode-agnostic and shared by both kernels.
     coverage: coverage::CoveragePipeline,
+    /// Convex coverage-accumulate pipeline (pass 1 of the crisp path, convex kernel). Reuses
+    /// `coverage`'s offscreen targets and resolve pass.
+    convex_accum: ConvexAccumPipeline,
+    /// Convex-shape uniform (sides/sharpness/rotation/corner-scale), updated via
+    /// [`Self::set_convex_params`]; bound at binding 2 by the convex pipelines.
+    convex_buffer: wgpu::Buffer,
+    /// Triangle-splat twin of `convex` (2D Triangle Splatting kernel). Selected per-frame by
+    /// the `render_doc_triangle*` paths; shares the resident buffer + camera uniform.
+    triangle: TriangleSplatPipeline,
+    /// Triangle coverage-accumulate pipeline (pass 1 of the crisp path, triangle kernel). Reuses
+    /// `coverage`'s offscreen targets and resolve pass.
+    triangle_accum: TriangleAccumPipeline,
+    /// Triangle-shape uniform (φ(s)/σ), updated via [`Self::set_triangle_params`]; bound at
+    /// binding 2 by the triangle pipelines.
+    triangle_buffer: wgpu::Buffer,
     /// Immediate-mode transient buffer for `render(&[GpuSplat])`.
     splats: SplatBuffer,
     camera_buffer: wgpu::Buffer,
@@ -61,20 +85,51 @@ pub struct SplatRenderer {
 impl SplatRenderer {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let pipeline = SplatPipeline::new(device, target_format);
+        let convex = ConvexSplatPipeline::new(device, target_format);
         let coverage = coverage::CoveragePipeline::new(device, target_format);
+        let convex_accum = ConvexAccumPipeline::new(device);
+        let triangle = TriangleSplatPipeline::new(device, target_format);
+        let triangle_accum = TriangleAccumPipeline::new(device);
         let splats = SplatBuffer::new(device, &[]);
         let camera_buffer = buffers::camera_buffer(device, &CameraUniform::default());
+        let convex_buffer = buffers::convex_buffer(device, &ConvexUniform::default());
+        let triangle_buffer = buffers::triangle_buffer(device, &TriangleUniform::default());
         let resident_capacity = MIN_RESIDENT_CAPACITY;
         let resident = create_resident_buffer(device, resident_capacity);
         Self {
             pipeline,
+            convex,
             coverage,
+            convex_accum,
+            convex_buffer,
+            triangle,
+            triangle_accum,
+            triangle_buffer,
             splats,
             camera_buffer,
             layout: Layout::default(),
             resident,
             resident_capacity,
         }
+    }
+
+    /// Update the convex-primitive uniform (no-op for the Gaussian paths). Builds a regular
+    /// `sides`-gon hull with smoothness `delta` (rounds the corners; higher → harder polygon)
+    /// and sharpness `sigma` (edge transition; higher → denser/crisper boundary) — the two
+    /// decoupled knobs from 3D Convex Splatting. Cheap; call only when the shape changes.
+    pub fn set_convex_params(&self, queue: &wgpu::Queue, sides: f32, delta: f32, sigma: f32) {
+        let u = ConvexUniform::new(sides, delta, sigma);
+        queue.write_buffer(&self.convex_buffer, 0, bytemuck::bytes_of(&u));
+    }
+
+    /// Update the triangle-primitive uniform (no-op for the Gaussian/convex paths). Builds an
+    /// equilateral triangle (circumradius in σ-units) rotated by `rotation` radians (0 = apex up)
+    /// with window smoothness `sigma` (σ→0 ⇒ a solid top-hat triangle, larger σ ⇒ a soft falloff
+    /// peaking at the incenter) — the window function from 2D Triangle Splatting. Cheap; call
+    /// only when the shape changes.
+    pub fn set_triangle_params(&self, queue: &wgpu::Queue, rotation: f32, sigma: f32) {
+        let u = TriangleUniform::new(rotation, sigma);
+        queue.write_buffer(&self.triangle_buffer, 0, bytemuck::bytes_of(&u));
     }
 
     /// Incrementally render the whole document into `view`, clearing to `clear` first.
@@ -132,51 +187,75 @@ impl SplatRenderer {
         clear: wgpu::Color,
     ) {
         self.upload_doc(device, queue, doc, camera);
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("resident splat bind group"),
-            layout: &self.pipeline.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.resident.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.camera_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
+        let bind_group = self.splat_bind_group(device, &self.resident);
         let ranges = self.layout.visible_ranges(view_min, view_max);
+        encode_resident_pass(
+            device,
+            queue,
+            view,
+            &self.pipeline.pipeline,
+            &bind_group,
+            &ranges,
+            clear,
+        );
+    }
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("splat encoder"),
-        });
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("splat pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rpass.set_pipeline(&self.pipeline.pipeline);
-            rpass.set_bind_group(0, &bind_group, &[]);
-            for (start, count) in ranges {
-                rpass.draw(0..6, start..start + count);
-            }
-        }
-        queue.submit(Some(encoder.finish()));
+    /// Convex-kernel twin of [`Self::render_doc`]: identical resident upload + view culling,
+    /// but draws through the convex-splat pipeline so the document renders as smooth convex
+    /// polygons. The convex shape comes from the uniform set by [`Self::set_convex_params`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_doc_convex(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        doc: &mut Document,
+        camera: &CameraUniform,
+        view_min: glam::Vec2,
+        view_max: glam::Vec2,
+        clear: wgpu::Color,
+    ) {
+        self.upload_doc(device, queue, doc, camera);
+        let bind_group = self.convex_bind_group(device, &self.resident);
+        let ranges = self.layout.visible_ranges(view_min, view_max);
+        encode_resident_pass(
+            device,
+            queue,
+            view,
+            &self.convex.pipeline,
+            &bind_group,
+            &ranges,
+            clear,
+        );
+    }
+
+    /// Triangle-kernel twin of [`Self::render_doc`]: identical resident upload + view culling,
+    /// but draws through the triangle-splat pipeline so the document renders as 2D triangle
+    /// splats. The triangle shape comes from the uniform set by [`Self::set_triangle_params`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_doc_triangle(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        doc: &mut Document,
+        camera: &CameraUniform,
+        view_min: glam::Vec2,
+        view_max: glam::Vec2,
+        clear: wgpu::Color,
+    ) {
+        self.upload_doc(device, queue, doc, camera);
+        let bind_group = self.triangle_bind_group(device, &self.resident);
+        let ranges = self.layout.visible_ranges(view_min, view_max);
+        encode_resident_pass(
+            device,
+            queue,
+            view,
+            &self.triangle.pipeline,
+            &bind_group,
+            &ranges,
+            clear,
+        );
     }
 
     /// Drop resident scene state. Call when the document is replaced wholesale (e.g. on
@@ -198,48 +277,66 @@ impl SplatRenderer {
     ) {
         self.splats.update(device, queue, splats);
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        let bind_group = self.splat_bind_group(device, &self.splats.buffer);
+        encode_resident_pass(
+            device,
+            queue,
+            view,
+            &self.pipeline.pipeline,
+            &bind_group,
+            &full_range(self.splats.len),
+            clear,
+        );
+    }
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("splat bind group"),
-            layout: &self.pipeline.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.splats.buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.camera_buffer.as_entire_binding(),
-                },
-            ],
-        });
+    /// Immediate-mode convex twin of [`Self::render`] (headless tests / thumbnails). The shape
+    /// comes from the uniform set by [`Self::set_convex_params`].
+    pub fn render_convex(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        splats: &[GpuSplat],
+        camera: &CameraUniform,
+        clear: wgpu::Color,
+    ) {
+        self.splats.update(device, queue, splats);
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        let bind_group = self.convex_bind_group(device, &self.splats.buffer);
+        encode_resident_pass(
+            device,
+            queue,
+            view,
+            &self.convex.pipeline,
+            &bind_group,
+            &full_range(self.splats.len),
+            clear,
+        );
+    }
 
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("splat encoder"),
-            });
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("splat pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rpass.set_pipeline(&self.pipeline.pipeline);
-            rpass.set_bind_group(0, &bind_group, &[]);
-            rpass.draw(0..6, 0..self.splats.len as u32);
-        }
-        queue.submit(Some(encoder.finish()));
+    /// Immediate-mode triangle twin of [`Self::render`] (headless tests / thumbnails). The shape
+    /// comes from the uniform set by [`Self::set_triangle_params`].
+    pub fn render_triangle(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        splats: &[GpuSplat],
+        camera: &CameraUniform,
+        clear: wgpu::Color,
+    ) {
+        self.splats.update(device, queue, splats);
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        let bind_group = self.triangle_bind_group(device, &self.splats.buffer);
+        encode_resident_pass(
+            device,
+            queue,
+            view,
+            &self.triangle.pipeline,
+            &bind_group,
+            &full_range(self.splats.len),
+            clear,
+        );
     }
 
     /// Crisp-perimeter twin of [`Self::render_doc`]: runs the two-pass coverage path
@@ -263,12 +360,80 @@ impl SplatRenderer {
         self.upload_doc(device, queue, doc, camera);
         let ranges = self.layout.visible_ranges(view_min, view_max);
         self.coverage.ensure(device, target_width, target_height);
+        let accum_bind_group = self.coverage_accum_bind_group(device, &self.resident);
         encode_crisp_passes(
             device,
             queue,
             &self.coverage,
-            &self.camera_buffer,
-            &self.resident,
+            &self.coverage.accum_pipeline,
+            &accum_bind_group,
+            &ranges,
+            view,
+            clear,
+        );
+    }
+
+    /// Convex-kernel twin of [`Self::render_doc_crisp`]: the two-pass coverage path with the
+    /// convex accumulate shader, so a convex-splat line gets one crisp (flat-sided) perimeter
+    /// while its interior keeps per-splat color fuzz. The convex direct path and this crisp
+    /// path together give convex splatting the same blending/crisp toolset as the Gaussian.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_doc_convex_crisp(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        doc: &mut Document,
+        camera: &CameraUniform,
+        view_min: glam::Vec2,
+        view_max: glam::Vec2,
+        target_width: u32,
+        target_height: u32,
+        clear: wgpu::Color,
+    ) {
+        self.upload_doc(device, queue, doc, camera);
+        let ranges = self.layout.visible_ranges(view_min, view_max);
+        self.coverage.ensure(device, target_width, target_height);
+        let accum_bind_group = self.convex_accum_bind_group(device, &self.resident);
+        encode_crisp_passes(
+            device,
+            queue,
+            &self.coverage,
+            &self.convex_accum.pipeline,
+            &accum_bind_group,
+            &ranges,
+            view,
+            clear,
+        );
+    }
+
+    /// Triangle-kernel twin of [`Self::render_doc_crisp`]: the two-pass coverage path with the
+    /// triangle accumulate shader, so a triangle-splat line gets one crisp perimeter (tracking
+    /// the triangle silhouette) while its interior keeps per-splat color fuzz.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_doc_triangle_crisp(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        doc: &mut Document,
+        camera: &CameraUniform,
+        view_min: glam::Vec2,
+        view_max: glam::Vec2,
+        target_width: u32,
+        target_height: u32,
+        clear: wgpu::Color,
+    ) {
+        self.upload_doc(device, queue, doc, camera);
+        let ranges = self.layout.visible_ranges(view_min, view_max);
+        self.coverage.ensure(device, target_width, target_height);
+        let accum_bind_group = self.triangle_accum_bind_group(device, &self.resident);
+        encode_crisp_passes(
+            device,
+            queue,
+            &self.coverage,
+            &self.triangle_accum.pipeline,
+            &accum_bind_group,
             &ranges,
             view,
             clear,
@@ -292,52 +457,279 @@ impl SplatRenderer {
         self.splats.update(device, queue, splats);
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
         self.coverage.ensure(device, width, height);
-        let all = [(0u32, self.splats.len as u32)];
-        let ranges: &[(u32, u32)] = if self.splats.len == 0 { &[] } else { &all };
+        let accum_bind_group = self.coverage_accum_bind_group(device, &self.splats.buffer);
         encode_crisp_passes(
             device,
             queue,
             &self.coverage,
-            &self.camera_buffer,
-            &self.splats.buffer,
-            ranges,
+            &self.coverage.accum_pipeline,
+            &accum_bind_group,
+            &full_range(self.splats.len),
             view,
             clear,
         );
     }
+
+    /// Immediate-mode convex crisp twin of [`Self::render_crisp`] (headless tests / thumbnails).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_convex_crisp(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        splats: &[GpuSplat],
+        camera: &CameraUniform,
+        width: u32,
+        height: u32,
+        clear: wgpu::Color,
+    ) {
+        self.splats.update(device, queue, splats);
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        self.coverage.ensure(device, width, height);
+        let accum_bind_group = self.convex_accum_bind_group(device, &self.splats.buffer);
+        encode_crisp_passes(
+            device,
+            queue,
+            &self.coverage,
+            &self.convex_accum.pipeline,
+            &accum_bind_group,
+            &full_range(self.splats.len),
+            view,
+            clear,
+        );
+    }
+
+    /// Immediate-mode triangle crisp twin of [`Self::render_crisp`] (headless tests / thumbnails).
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_triangle_crisp(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        splats: &[GpuSplat],
+        camera: &CameraUniform,
+        width: u32,
+        height: u32,
+        clear: wgpu::Color,
+    ) {
+        self.splats.update(device, queue, splats);
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+        self.coverage.ensure(device, width, height);
+        let accum_bind_group = self.triangle_accum_bind_group(device, &self.splats.buffer);
+        encode_crisp_passes(
+            device,
+            queue,
+            &self.coverage,
+            &self.triangle_accum.pipeline,
+            &accum_bind_group,
+            &full_range(self.splats.len),
+            view,
+            clear,
+        );
+    }
+
+    // --- Bind-group builders -------------------------------------------------------------
+    // Each builds the per-pass bind group against the supplied splat buffer (the resident
+    // buffer for the `render_doc*` paths, the transient buffer for the immediate-mode ones).
+    // They are split by pipeline because a bind group must be created against the exact layout
+    // its pipeline uses, and the convex pipelines add the convex uniform at binding 2.
+
+    /// Gaussian direct pipeline: storage splats (0) + camera (1).
+    fn splat_bind_group(&self, device: &wgpu::Device, splats: &wgpu::Buffer) -> wgpu::BindGroup {
+        self.two_binding_group(device, &self.pipeline.bind_group_layout, splats, "splat bind group")
+    }
+
+    /// Gaussian coverage-accum pipeline: storage splats (0) + camera (1).
+    fn coverage_accum_bind_group(
+        &self,
+        device: &wgpu::Device,
+        splats: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.two_binding_group(
+            device,
+            &self.coverage.accum_bind_group_layout,
+            splats,
+            "coverage accum bind group",
+        )
+    }
+
+    /// Convex direct pipeline: storage splats (0) + camera (1) + convex uniform (2).
+    fn convex_bind_group(&self, device: &wgpu::Device, splats: &wgpu::Buffer) -> wgpu::BindGroup {
+        self.three_binding_group(
+            device,
+            &self.convex.bind_group_layout,
+            splats,
+            &self.convex_buffer,
+            "convex bind group",
+        )
+    }
+
+    /// Convex coverage-accum pipeline: storage splats (0) + camera (1) + convex uniform (2).
+    fn convex_accum_bind_group(
+        &self,
+        device: &wgpu::Device,
+        splats: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.three_binding_group(
+            device,
+            &self.convex_accum.bind_group_layout,
+            splats,
+            &self.convex_buffer,
+            "convex accum bind group",
+        )
+    }
+
+    /// Triangle direct pipeline: storage splats (0) + camera (1) + triangle uniform (2).
+    fn triangle_bind_group(
+        &self,
+        device: &wgpu::Device,
+        splats: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.three_binding_group(
+            device,
+            &self.triangle.bind_group_layout,
+            splats,
+            &self.triangle_buffer,
+            "triangle bind group",
+        )
+    }
+
+    /// Triangle coverage-accum pipeline: storage splats (0) + camera (1) + triangle uniform (2).
+    fn triangle_accum_bind_group(
+        &self,
+        device: &wgpu::Device,
+        splats: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.three_binding_group(
+            device,
+            &self.triangle_accum.bind_group_layout,
+            splats,
+            &self.triangle_buffer,
+            "triangle accum bind group",
+        )
+    }
+
+    fn two_binding_group(
+        &self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        splats: &wgpu::Buffer,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: splats.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    fn three_binding_group(
+        &self,
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        splats: &wgpu::Buffer,
+        uniform: &wgpu::Buffer,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: splats.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        })
+    }
+}
+
+/// Visible draw range for an immediate-mode (single-slice) draw: the whole buffer, or empty
+/// when there are no splats (so the draw call requests zero instances).
+fn full_range(len: usize) -> Vec<(u32, u32)> {
+    if len == 0 {
+        Vec::new()
+    } else {
+        vec![(0, len as u32)]
+    }
+}
+
+/// Encode + submit one instanced color pass: bind `pipeline` + `bind_group` and draw each
+/// visible `(start, count)` instance range into `view`, clearing to `clear` first. Shared by
+/// the Gaussian and convex direct paths (`render_doc*` / `render*`).
+fn encode_resident_pass(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    view: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    ranges: &[(u32, u32)],
+    clear: wgpu::Color,
+) {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("splat encoder"),
+    });
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("splat pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rpass.set_pipeline(pipeline);
+        rpass.set_bind_group(0, bind_group, &[]);
+        for (start, count) in ranges {
+            rpass.draw(0..6, *start..*start + *count);
+        }
+    }
+    queue.submit(Some(encoder.finish()));
 }
 
 /// Encode and submit the two crisp-path passes: accumulate the splat instances in `ranges`
-/// into the coverage pipeline's offscreen targets, then resolve them into `view` (cleared to
-/// `clear` first). The caller must have already sized the targets via
-/// [`coverage::CoveragePipeline::ensure`] and uploaded the splat + camera buffers.
+/// into the coverage pipeline's offscreen targets (using the caller-supplied `accum_pipeline`
+/// and `accum_bind_group`), then resolve them into `view` (cleared to `clear` first). The
+/// accumulate pipeline differs by kernel (Gaussian vs convex) while the resolve pass and
+/// offscreen targets — owned by `coverage` — are mode-agnostic and shared. The caller must
+/// have sized the targets via [`coverage::CoveragePipeline::ensure`] and uploaded the buffers.
 #[allow(clippy::too_many_arguments)]
 fn encode_crisp_passes(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     coverage: &coverage::CoveragePipeline,
-    camera_buffer: &wgpu::Buffer,
-    splats_buffer: &wgpu::Buffer,
+    accum_pipeline: &wgpu::RenderPipeline,
+    accum_bind_group: &wgpu::BindGroup,
     ranges: &[(u32, u32)],
     view: &wgpu::TextureView,
     clear: wgpu::Color,
 ) {
     let targets = coverage.current_targets();
-
-    let accum_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("coverage accum bind group"),
-        layout: &coverage.accum_bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: splats_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: camera_buffer.as_entire_binding(),
-            },
-        ],
-    });
     let resolve_bind_group = coverage.resolve_bind_group(device, targets);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -373,8 +765,8 @@ fn encode_crisp_passes(
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        rpass.set_pipeline(&coverage.accum_pipeline);
-        rpass.set_bind_group(0, &accum_bind_group, &[]);
+        rpass.set_pipeline(accum_pipeline);
+        rpass.set_bind_group(0, accum_bind_group, &[]);
         for (start, count) in ranges {
             rpass.draw(0..6, *start..*start + *count);
         }

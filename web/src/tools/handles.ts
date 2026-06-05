@@ -125,3 +125,86 @@ export function drawEditOverlay(
 export function clearEditOverlay(ctx: CanvasRenderingContext2D): void {
   ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
 }
+
+/**
+ * Clear `ctx` and draw the vector-draw curvature-fit overlay described by `data`.
+ *
+ * The Rust `WasmApp.vector_overlay()` returns the in-progress adaptive curvature fit,
+ * already projected into device-pixel screen space. Each segment between two anchors is
+ * one adaptive window — windows are long/sparse where the drawing is straight and
+ * short/dense where it curves. `dpr` scales line widths and marker sizes so they stay a
+ * constant size on screen regardless of device-pixel ratio.
+ *
+ * Layout (all values device pixels):
+ *   [ segCount,
+ *     // repeated segCount times — one polyline per segment:
+ *     ptCount, x0, y0, x1, y1, ...,
+ *     // then anchors (3 floats each; isCorner is 1.0 or 0.0):
+ *     anchorCount, ax0, ay0, isCorner0, ax1, ay1, isCorner1, ... ]
+ *
+ * The last segment (index segCount-1) is the "active window" still being grown and is
+ * drawn brighter/thicker than the committed ones.
+ */
+export function drawVectorOverlay(
+  ctx: CanvasRenderingContext2D,
+  data: Float32Array,
+  dpr: number
+): void {
+  const { canvas } = ctx;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (data.length < 1) return;
+
+  let i = 0;
+  const segCount = data[i++];
+
+  // 1) Segment polylines. The last segment is the active window — brighter & thicker.
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  for (let s = 0; s < segCount; s++) {
+    if (i >= data.length) break;
+    const ptCount = data[i++];
+    const isActive = s === segCount - 1;
+    ctx.beginPath();
+    for (let p = 0; p < ptCount; p++) {
+      if (i + 1 >= data.length) break;
+      const x = data[i++];
+      const y = data[i++];
+      if (p === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = isActive ? "#ff0000" : "#ff5a52";
+    ctx.lineWidth = (isActive ? 3.5 : 2) * dpr;
+    ctx.stroke();
+  }
+
+  // 2) Anchors: smooth = hollow white square with red border; corner = solid red 45° diamond.
+  if (i >= data.length) return;
+  const anchorCount = data[i++];
+  const half = 4 * dpr;
+  ctx.lineWidth = 1.5 * dpr;
+  for (let a = 0; a < anchorCount; a++) {
+    if (i + 2 >= data.length) break;
+    const ax = data[i++];
+    const ay = data[i++];
+    const isCorner = data[i++];
+    if (isCorner === 1) {
+      // Corner: solid red square rotated 45° into a diamond.
+      ctx.save();
+      ctx.translate(ax, ay);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = "#ff0000";
+      ctx.beginPath();
+      ctx.rect(-half, -half, half * 2, half * 2);
+      ctx.fill();
+      ctx.restore();
+    } else {
+      // Smooth: hollow white square with a red border.
+      ctx.fillStyle = "#ffffff";
+      ctx.strokeStyle = "#ff0000";
+      ctx.beginPath();
+      ctx.rect(ax - half, ay - half, half * 2, half * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+}

@@ -9,7 +9,7 @@ use app_core::bezier::{BezierSkeleton, CubicBezier};
 use app_core::brush::BrushModel;
 use app_core::document::Document;
 use app_core::math::Vec2;
-use app_core::{fit_polyline_to_skeleton, simplify_rdp};
+use app_core::{fit_polyline_adaptive, fit_polyline_to_skeleton, simplify_rdp, AdaptiveFitParams};
 
 /// Densely sample a polyline along a single cubic at `n` even native-parameter steps.
 fn sample_cubic(curve: &CubicBezier, n: usize) -> Vec<Vec2> {
@@ -134,4 +134,123 @@ fn add_freehand_stroke_produces_splats() {
     // Registered on the layer.
     assert_eq!(doc.layers[0].stroke_ids, vec![sid]);
     assert!(doc.splat_count() > 0);
+}
+
+// --- 5. Curvature-adaptive fitter -------------------------------------------------
+
+/// Anchor count of the RDP path (for the minimal-anchors comparison below).
+fn rdp_segments(pts: &[Vec2], tol: f32) -> usize {
+    simplify_rdp(pts, tol).len() - 1
+}
+
+#[test]
+fn adaptive_collapses_a_straight_line_to_one_segment() {
+    let a = Vec2::new(0.0, 50.0);
+    let b = Vec2::new(500.0, 50.0);
+    let pts: Vec<Vec2> = (0..=100).map(|i| a.lerp(b, i as f32 / 100.0)).collect();
+
+    let sk = fit_polyline_adaptive(&pts, &AdaptiveFitParams::default());
+    assert_eq!(sk.segments.len(), 1, "a straight line needs exactly one window");
+    assert!(max_tracking_error(&sk, &pts) < 1.0);
+    // Endpoints are never flagged as corners.
+    assert!(sk.anchors.iter().all(|m| !m.corner));
+}
+
+#[test]
+fn adaptive_tracks_a_known_cubic_with_minimal_anchors() {
+    let curve = CubicBezier::new(
+        Vec2::new(100.0, 200.0),
+        Vec2::new(180.0, 40.0),
+        Vec2::new(320.0, 360.0),
+        Vec2::new(420.0, 200.0),
+    );
+    let pts = sample_cubic(&curve, 200);
+
+    let params = AdaptiveFitParams::default();
+    let sk = fit_polyline_adaptive(&pts, &params);
+
+    // Tracks the source closely, with endpoints preserved.
+    assert!((sk.frame_at_arc_t(0.0).position - curve.p0).length() < 2.0);
+    assert!((sk.frame_at_arc_t(1.0).position - curve.p3).length() < 2.0);
+    let err = max_tracking_error(&sk, &pts);
+    assert!(err < params.tolerance + 2.5, "adaptive fit error = {err}");
+
+    // The least-squares window fit needs no more anchors than RDP for the same tolerance —
+    // the "minimal anchors" property — and only a handful in absolute terms.
+    let adaptive = sk.segments.len();
+    let rdp = rdp_segments(&pts, params.tolerance);
+    assert!(
+        adaptive <= rdp,
+        "adaptive used more windows ({adaptive}) than RDP anchors ({rdp})"
+    );
+    assert!(adaptive <= 3, "a single smooth cubic should need very few windows, got {adaptive}");
+}
+
+#[test]
+fn adaptive_preserves_a_sharp_corner_as_an_independent_anchor() {
+    // An "L": right along x, then up. The corner is at (100, 0).
+    let mut pts: Vec<Vec2> = Vec::new();
+    for i in 0..=40 {
+        pts.push(Vec2::new(i as f32 * 2.5, 0.0)); // (0,0) -> (100,0)
+    }
+    for i in 1..=40 {
+        pts.push(Vec2::new(100.0, i as f32 * 2.5)); // (100,0) -> (100,100)
+    }
+
+    let sk = fit_polyline_adaptive(&pts, &AdaptiveFitParams::default());
+
+    assert!(sk.segments.len() >= 2, "an L needs >= 2 windows");
+    // A corner anchor sits at the bend and is flagged (so the edit tool keeps it sharp).
+    let corner_idx = (0..sk.anchor_count())
+        .find(|&j| (sk.anchor_position(j) - Vec2::new(100.0, 0.0)).length() < 6.0);
+    let corner_idx = corner_idx.expect("an anchor should land on the bend");
+    assert!(sk.anchors[corner_idx].corner, "the bend anchor must be flagged a corner");
+    // And the fit still passes near the corner.
+    assert!(max_tracking_error(&sk, &pts) < 8.0);
+}
+
+#[test]
+fn adaptive_window_is_long_when_straight_and_short_when_curved() {
+    // A long straight run, then a semicircle. The straight run should be covered by a single
+    // long window (its terminating anchor lands near the bend); the semicircle turns a full
+    // π — more than one window's turning budget — so it must be split into several short
+    // windows. That contrast is exactly the curvature-adaptive behaviour.
+    let mut pts: Vec<Vec2> = Vec::new();
+    for i in 0..=80 {
+        pts.push(Vec2::new(i as f32 * 2.5, 0.0)); // (0,0) -> (200,0), straight
+    }
+    let r = 40.0;
+    let center = Vec2::new(200.0, r);
+    for i in 1..=120 {
+        // Sweep π radians (a half turn), so the budget forces multiple windows in the arc.
+        let ang = -std::f32::consts::FRAC_PI_2 + (i as f32 / 120.0) * std::f32::consts::PI;
+        pts.push(center + Vec2::new(ang.cos() * r, ang.sin() * r));
+    }
+
+    let sk = fit_polyline_adaptive(&pts, &AdaptiveFitParams::default());
+
+    // The straight run is one window: the second anchor is far down the straight part.
+    assert!(
+        sk.anchor_position(1).x >= 150.0,
+        "straight run should be a single long window; 2nd anchor x = {}",
+        sk.anchor_position(1).x
+    );
+    // The curve forces extra anchors -> more total windows than a pure straight line.
+    assert!(sk.segments.len() >= 3, "tight curve should add windows, got {}", sk.segments.len());
+    assert!(max_tracking_error(&sk, &pts) < 4.0);
+}
+
+#[test]
+fn adaptive_handles_degenerate_inputs() {
+    // Single point and two points must still yield a usable (non-empty) skeleton.
+    let one = fit_polyline_adaptive(&[Vec2::new(5.0, 5.0)], &AdaptiveFitParams::default());
+    assert_eq!(one.segments.len(), 1);
+    assert!(one.total_length() > 0.0);
+
+    let two = fit_polyline_adaptive(
+        &[Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0)],
+        &AdaptiveFitParams::default(),
+    );
+    assert!(!two.segments.is_empty());
+    assert!((two.frame_at_arc_t(1.0).position - Vec2::new(100.0, 0.0)).length() < 1.0);
 }
