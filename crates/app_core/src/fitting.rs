@@ -234,6 +234,20 @@ pub struct AdaptiveFitParams {
     /// the turning estimates don't depend on raw pointer-sampling density (which varies with
     /// draw speed).
     pub resample_step: f32,
+    /// Softness/strictness of the fit in `[0,1]` — how strongly anchors are biased toward the
+    /// *curvature extrema* of the stroke (the apex of each bend: a sine wave's peaks and
+    /// troughs) rather than spread evenly by the turning budget.
+    ///
+    /// * `0.0` (strict): pure curvature-adaptive tracking — anchors land wherever the turning
+    ///   budget / tolerance demand. Hugs the input closely, more anchors.
+    /// * `1.0` (soft): anchors are pinned at the salient curvature extrema (plus corners and
+    ///   endpoints) and the turning budget / tolerance are relaxed so *no* extra anchors are
+    ///   inserted between them — a sine wave fits as one cubic per peak-to-trough arc.
+    ///
+    /// Intermediate values both pin the extrema and progressively relax the budget. At `0.0`
+    /// the extrema pass is skipped entirely, so the fit is byte-identical to the original
+    /// curvature-adaptive behaviour.
+    pub smoothness: f32,
 }
 
 impl Default for AdaptiveFitParams {
@@ -243,9 +257,89 @@ impl Default for AdaptiveFitParams {
             max_turn: 1.9,    // ≈ 109°
             corner_turn: 1.1, // ≈ 63°
             resample_step: 3.0,
+            smoothness: 0.0,
         }
     }
 }
+
+impl AdaptiveFitParams {
+    /// Per-window turning budget after applying `smoothness`. Relaxed upward as the fit softens
+    /// so that — once the curvature extrema are pinned as anchors — the budget stops inserting
+    /// *extra* anchors between them. At `smoothness == 0` this is exactly `max_turn`; at `1.0`
+    /// it is large enough that no bounded inter-extremum span ever trips it.
+    fn effective_max_turn(&self) -> f32 {
+        let s = self.smoothness.clamp(0.0, 1.0);
+        self.max_turn.max(0.05) + s * 6.0
+    }
+
+    /// Fit tolerance after applying `smoothness`. Opened up substantially as the fit softens:
+    /// "soft" means a loose interpolation, so the per-window error budget must comfortably exceed
+    /// typical hand jitter (a few px), otherwise that jitter forces a tolerance-driven split on
+    /// every wobble and the stroke over-segments through a curvature change. At `smoothness == 0`
+    /// this is exactly `tolerance`; at `1.0` it is 6× — loose enough to ride over the noise.
+    fn effective_tolerance(&self) -> f32 {
+        let s = self.smoothness.clamp(0.0, 1.0);
+        self.tolerance.max(1e-3) * (1.0 + 5.0 * s)
+    }
+
+    /// Per-vertex curvature-extremum mask for `pts`. Empty (all-false) when `smoothness == 0`
+    /// so the strict path is unchanged; otherwise the salient local maxima of curvature (see
+    /// [`detect_curvature_extrema`]). `smoothness` controls *selectivity*: softer fits demand a
+    /// deeper curvature dip around each apex and a wider minimum spacing between anchors, so one
+    /// bend yields exactly one anchor instead of a cluster.
+    fn curvature_extrema(&self, pts: &[Vec2]) -> Vec<bool> {
+        let s = self.smoothness.clamp(0.0, 1.0);
+        if s <= 0.0 {
+            return vec![false; pts.len()];
+        }
+        // Minimum topographic prominence (radians of wide-support turning) for an apex to count
+        // as a real bend rather than a residual noise hump. The noise floor on a hand-drawn curve
+        // sits around ~0.3 at this support; genuine bends rise well above it. Raising the bar with
+        // softness keeps only the boldest bends when the slider is pushed toward "soft".
+        let min_prominence = 0.35 + 0.20 * s;
+        // Minimum separation between anchors, in resampled samples. Widens with softness so a
+        // broad bend collapses to a single anchor rather than a row of them.
+        let min_spacing = (4.0 + 12.0 * s).round() as usize;
+        detect_curvature_extrema(pts, min_prominence, min_spacing)
+    }
+
+    /// Per-vertex turning that feeds the window budget in [`adaptive_breakpoints`]. At
+    /// `smoothness == 0` it is the raw [`turning_angles`] (the original behaviour). When
+    /// softening it is measured on position-smoothed samples: raw per-vertex turning on a
+    /// hand-drawn stroke is jitter-dominated and sums up fast, which would make the budget close
+    /// a window in the *middle* of a smooth bend on a noisy stroke (the spurious cluster of extra
+    /// anchors the user is seeing). De-noising it lets the budget reflect the real turning, so
+    /// within a bend only the pinned curvature extrema and the tolerance can introduce a split.
+    fn budget_turning(&self, pts: &[Vec2]) -> Vec<f32> {
+        if self.smoothness <= 0.0 {
+            turning_angles(pts)
+        } else {
+            turning_angles(&smooth_positions(pts, 4))
+        }
+    }
+}
+
+/// `passes` rounds of [0.25, 0.5, 0.25] neighbour averaging over the interior, endpoints pinned.
+/// A cheap low-pass on the polyline used to take hand jitter off the curvature/turning estimates
+/// without moving the stroke's endpoints.
+fn smooth_positions(pts: &[Vec2], passes: usize) -> Vec<Vec2> {
+    let n = pts.len();
+    let mut sm = pts.to_vec();
+    if n < 3 {
+        return sm;
+    }
+    for _ in 0..passes {
+        let raw = sm.clone();
+        for i in 1..n - 1 {
+            sm[i] = raw[i - 1] * 0.25 + raw[i] * 0.5 + raw[i + 1] * 0.25;
+        }
+    }
+    sm
+}
+
+/// Absolute curvature floor (radians of wide-support turning) below which an apex is treated as
+/// pointer jitter on a near-straight run, not a real bend. Keeps noise from spawning anchors.
+const EXTREMA_FLOOR: f32 = 0.1;
 
 /// Fit a freehand polyline to a [`BezierSkeleton`] with a curvature-adaptive window (see the
 /// module section above). The returned skeleton has its per-anchor `corner` flags set, so
@@ -263,25 +357,22 @@ pub fn fit_polyline_adaptive(points: &[Vec2], params: &AdaptiveFitParams) -> Bez
         return BezierSkeleton::single(fit_cubic_lsq(&pts).0);
     }
 
-    let tol = params.tolerance.max(1e-3);
-    let max_turn = params.max_turn.max(0.05);
+    let tol = params.effective_tolerance();
+    let max_turn = params.effective_max_turn();
     let corner_turn = params.corner_turn.max(0.05);
 
-    let turn = turning_angles(&pts);
+    let turn = params.budget_turning(&pts);
     let corners = detect_corners(&pts, corner_turn);
-    let breakpoints = adaptive_breakpoints(&pts, &turn, &corners, max_turn, tol, usize::MAX);
+    let extrema = params.curvature_extrema(&pts);
+    let breakpoints =
+        adaptive_breakpoints(&pts, &turn, &corners, &extrema, max_turn, tol, usize::MAX);
 
-    // One cubic per [bp, next-bp] window.
-    let mut segments: Vec<CubicBezier> = Vec::with_capacity(breakpoints.len().saturating_sub(1));
-    for w in breakpoints.windows(2) {
-        segments.push(fit_cubic_lsq(&pts[w[0]..=w[1]]).0);
-    }
+    // One cubic per [bp, next-bp] window, C1 across smooth interior joins by construction.
+    let mut segments = fit_windows_c1(&pts, &breakpoints, &corners, None, None);
     if segments.is_empty() {
         segments.push(fit_cubic_lsq(&pts).0);
     }
 
-    // Make smooth (non-corner) interior joins visually C1, then assemble and flag corners.
-    smooth_interior_joins(&mut segments, &breakpoints, &corners);
     let mut sk = BezierSkeleton::from_segments(segments, false);
     for (j, &idx) in breakpoints.iter().enumerate() {
         if let Some(meta) = sk.anchors.get_mut(j) {
@@ -389,24 +480,196 @@ fn detect_corners(pts: &[Vec2], corner_turn: f32) -> Vec<bool> {
     is_corner
 }
 
+/// Smoothed curvature magnitude at each interior vertex: a ±K wide-support chord angle (robust
+/// to single-step jitter) followed by several [0.25, 0.5, 0.25] passes. Because the input is
+/// resampled to ~uniform arc length this is proportional to |curvature|, so its local maxima
+/// are the apexes of the stroke's bends.
+///
+/// The heavy smoothing is deliberate: a hand-drawn curve carries enough jitter that the raw
+/// curvature signal has a local maximum every few samples. Without it, *one* visual bend would
+/// spawn a whole cluster of anchors. Smoothing merges that jitter into a single broad hump per
+/// real bend, so a sustained curve reads as one plateau (no spurious peaks) and only genuine
+/// turns survive as maxima.
+fn curvature_magnitude(pts: &[Vec2]) -> Vec<f32> {
+    let n = pts.len();
+    let mut c = vec![0.0f32; n];
+    if n < 3 {
+        return c;
+    }
+    // Heavily low-pass the *positions* first. At a fine resample step a couple of px of hand
+    // jitter produces per-sample turning that dwarfs the true curvature of a gentle bend, so a
+    // curvature estimate on the raw samples is noise-dominated. Jitter is high-frequency (it
+    // alternates sample to sample) while a real bend spans many samples, so several binomial
+    // passes erase the noise without touching the shape of genuine turns. (Endpoints stay
+    // pinned; only the curvature *estimate* uses these — the fit itself runs on the original
+    // samples, so accuracy is unaffected.)
+    let sm = smooth_positions(pts, 4);
+    // Measure turning between two *wide* chords (±K samples). The wide support is the key to
+    // telling a real bend from jitter: a genuine turn keeps bending the same way across the whole
+    // span, so the wide angle adds up; residual noise alternates direction and averages out. At a
+    // ~3px resample step this spans ~50px each side — the scale of a feature the eye reads as "a
+    // bend" rather than "a wobble".
+    const K: usize = 18;
+    for i in 1..n - 1 {
+        let lo = i.saturating_sub(K);
+        let hi = (i + K).min(n - 1);
+        let a = sm[i] - sm[lo];
+        let b = sm[hi] - sm[i];
+        if a.length_squared() > 1e-12 && b.length_squared() > 1e-12 {
+            c[i] = (a.x * b.y - a.y * b.x).atan2(a.dot(b)).abs();
+        }
+    }
+    // A final couple of passes over the curvature profile itself, to merge any residual ripple.
+    for _ in 0..2 {
+        let raw = c.clone();
+        for i in 1..n - 1 {
+            c[i] = raw[i - 1] * 0.25 + raw[i] * 0.5 + raw[i + 1] * 0.25;
+        }
+    }
+    // Pin the (unmeasured) endpoints to their neighbours so the prominence walk in
+    // `detect_curvature_extrema` doesn't see an artificial zero-valley at the array ends and
+    // declare every near-end bump maximally prominent.
+    if n >= 2 {
+        c[0] = c[1];
+        c[n - 1] = c[n - 2];
+    }
+    c
+}
+
+/// Detect curvature extrema — the apex of each distinct bend (e.g. the peaks and troughs of a
+/// sine wave). A vertex is a *candidate* when its smoothed curvature is (a) a local maximum,
+/// (b) above [`EXTREMA_FLOOR`] (so pointer jitter on a near-straight run is ignored), and (c)
+/// topographically *prominent*: walking outward to the next higher curvature peak (or an
+/// endpoint), the curvature must rise above its higher-side valley by at least `min_prominence`
+/// radians. Because curvature is measured over a wide support, a real bend (which keeps turning
+/// the same way across the span) towers over the residual ripple left by hand jitter, so the
+/// prominence cleanly separates the two — and a constant-radius arc, whose curvature is a flat
+/// plateau, yields no prominent apex at all.
+///
+/// Candidates are then thinned by prominence-ranked non-max suppression: the most prominent apex
+/// wins, and any candidate within `min_spacing` samples of an already-kept one is dropped. That
+/// is what guarantees *one anchor per bend* — a wobbly hand-drawn turn produces several nearby
+/// candidates, but only its strongest survives. Endpoints and their immediate neighbours are
+/// never flagged (the endpoints are already anchors).
+fn detect_curvature_extrema(pts: &[Vec2], min_prominence: f32, min_spacing: usize) -> Vec<bool> {
+    let n = pts.len();
+    let mut mask = vec![false; n];
+    if n < 5 {
+        return mask;
+    }
+    let c = curvature_magnitude(pts);
+    const K: usize = 2;
+    // (idx, prominence) for every apex passing the local-max + floor + prominence gates.
+    let mut cands: Vec<(usize, f32)> = Vec::new();
+    for i in 2..n - 2 {
+        if c[i] < EXTREMA_FLOOR {
+            continue;
+        }
+        // (a) local maximum within ±K.
+        let lo = i.saturating_sub(K);
+        let hi = (i + K).min(n - 1);
+        if !(lo..=hi).all(|j| c[j] <= c[i] + 1e-6) {
+            continue;
+        }
+        // (c) prominence: the deepest valley reached before curvature climbs past this apex
+        //     again, on each side. The controlling col is the *higher* of the two valleys.
+        let mut left_min = c[i];
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            if c[j] > c[i] + 1e-6 {
+                break;
+            }
+            left_min = left_min.min(c[j]);
+        }
+        let mut right_min = c[i];
+        let mut j = i;
+        while j < n - 1 {
+            j += 1;
+            if c[j] > c[i] + 1e-6 {
+                break;
+            }
+            right_min = right_min.min(c[j]);
+        }
+        let col = left_min.max(right_min);
+        if c[i] - col >= min_prominence {
+            cands.push((i, c[i] - col));
+        }
+    }
+
+    if cands.is_empty() {
+        return mask;
+    }
+
+    // Collapse each connected curvature *hump* to a single anchor at its centre. A rounded bend
+    // (constant curvature across the turn) smooths into a flat-topped plateau, so the gate above
+    // marks a whole run of equally-prominent maxima across it; emitting each would place two
+    // anchors straddling the apex instead of one on it. `cands` is in ascending index order, so
+    // we walk it and merge neighbours that sit on the same hump — defined as the curvature between
+    // them never dipping by `min_prominence` (a shallow saddle). A genuinely separate bend (deep
+    // saddle, e.g. a sine's peak and the next trough, where curvature falls to ~0 between them) is
+    // left as its own hump. Each cluster collapses to the midpoint of its span — the apex.
+    let mut clusters: Vec<(usize, f32)> = Vec::new();
+    let mut i = 0;
+    while i < cands.len() {
+        let start = i;
+        let mut best = cands[i].1;
+        while i + 1 < cands.len() {
+            let (a, b) = (cands[i].0, cands[i + 1].0);
+            let saddle = c[a..=b].iter().copied().fold(f32::INFINITY, f32::min);
+            if c[a].min(c[b]) - saddle < min_prominence {
+                i += 1; // same hump — keep extending the cluster
+                best = best.max(cands[i].1);
+            } else {
+                break; // a real valley separates them — distinct bends
+            }
+        }
+        clusters.push(((cands[start].0 + cands[i].0) / 2, best));
+        i += 1;
+    }
+
+    // Prominence-ranked NMS across the (already apex-centred) hump clusters: keep the boldest,
+    // drop any whose centre is within `min_spacing` of a kept one.
+    clusters.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let spacing = min_spacing.max(1);
+    let mut kept: Vec<usize> = Vec::new();
+    for (idx, _) in clusters {
+        if kept.iter().all(|&k| idx.abs_diff(k) >= spacing) {
+            kept.push(idx);
+            mask[idx] = true;
+        }
+    }
+    mask
+}
+
 /// Ordered breakpoint (anchor) indices along the resampled polyline: the two endpoints,
-/// every corner, and the adaptive interior splits. Within each smooth span a window grows
-/// while accumulated turning stays under `max_turn`, then is shrunk until a single cubic fits
-/// within `tol`. `max_window` caps a window at that many samples even on a perfectly straight
-/// run (where neither the turning budget nor the tolerance would ever close it) — used by the
-/// incremental fitter to keep the live open window bounded; pass `usize::MAX` to disable.
+/// every corner, every pinned curvature `extrema`, and the adaptive interior splits. Within
+/// each remaining span a window grows while accumulated turning stays under `max_turn`, then is
+/// shrunk until a single cubic fits within `tol`. `max_window` caps a window at that many
+/// samples even on a perfectly straight run (where neither the turning budget nor the tolerance
+/// would ever close it) — used by the incremental fitter to keep the live open window bounded;
+/// pass `usize::MAX` to disable.
+///
+/// Corners and curvature extrema are both *hard* splits, but they differ downstream: corners
+/// keep independent tangents (stay sharp), while extrema are smooth joins (the caller leaves
+/// their `corner` flag false, so `smooth_interior_joins` makes them C1). Pinning extrema biases
+/// the anchors toward the apex of each bend; relaxing `max_turn`/`tol` (via the params'
+/// `smoothness`) then stops the budget inserting extra anchors between them.
 fn adaptive_breakpoints(
     pts: &[Vec2],
     turn: &[f32],
     corners: &[bool],
+    extrema: &[bool],
     max_turn: f32,
     tol: f32,
     max_window: usize,
 ) -> Vec<usize> {
     let n = pts.len();
-    // Hard anchors that always split the path: endpoints + corners.
+    // Hard anchors that always split the path: endpoints + corners + curvature extrema. The
+    // single ascending filter keeps the indices sorted and de-duplicated even when a vertex is
+    // flagged as both a corner and an extremum.
     let mut hard = vec![0usize];
-    hard.extend((1..n - 1).filter(|&i| corners[i]));
+    hard.extend((1..n - 1).filter(|&i| corners[i] || extrema[i]));
     hard.push(n - 1);
 
     let mut bp = vec![0usize];
@@ -435,36 +698,26 @@ fn adaptive_breakpoints(
     bp
 }
 
-/// After fitting, rotate the two handles at each smooth (non-corner) interior anchor to be
-/// collinear through the anchor, keeping each handle's length — a visually C1 join. Corner
-/// anchors are left untouched so they stay sharp.
-fn smooth_interior_joins(segments: &mut [CubicBezier], breakpoints: &[usize], corners: &[bool]) {
-    for j in 1..segments.len() {
-        let idx = breakpoints[j];
-        if corners.get(idx).copied().unwrap_or(false) {
-            continue;
-        }
-        let anchor = segments[j].p0; // == segments[j - 1].p3
-        let out_dir = segments[j].p1 - anchor; // forward
-        let in_dir = segments[j - 1].p2 - anchor; // backward
-        let len_out = out_dir.length();
-        let len_in = in_dir.length();
-        // Average direction: `out` points forward, `in` points backward, so subtract.
-        let t = out_dir.normalize_or_zero() - in_dir.normalize_or_zero();
-        if t.length_squared() < 1e-12 {
-            continue;
-        }
-        let t = t.normalize();
-        segments[j].p1 = anchor + t * len_out;
-        segments[j - 1].p2 = anchor - t * len_in;
-    }
-}
-
 /// Least-squares fit of one cubic to a window of points, with fixed endpoints and
 /// data-estimated end-tangent directions (Schneider). Returns the cubic and its max
 /// at-parameter deviation. Centripetal parameterization plus one Newton reparameterization
 /// pass keep the error low so each window can stretch as far as the tolerance allows.
 fn fit_cubic_lsq(pts: &[Vec2]) -> (CubicBezier, f32) {
+    let n = pts.len();
+    if n < 3 {
+        // Degenerate window: no interior to estimate tangents from. The with-tangents form
+        // handles the <2 / ==2 cases; pass any directions (unused for the straight fallback).
+        return fit_cubic_lsq_with_tangents(pts, Vec2::X, -Vec2::X);
+    }
+    fit_cubic_lsq_with_tangents(pts, start_tangent(pts), end_tangent(pts))
+}
+
+/// As [`fit_cubic_lsq`], but with the two end-tangent *directions* supplied by the caller
+/// (`t_hat1` leaves `p0` forward; `t_hat2` leaves `p3` backward, per `solve_handles`). The
+/// least-squares solve still chooses the handle *lengths* that best fit the samples. Used to
+/// stitch neighbouring windows with a shared tangent at smooth joins — C1 by construction,
+/// without the curve-bowing that rotating already-fitted handles caused.
+fn fit_cubic_lsq_with_tangents(pts: &[Vec2], t_hat1: Vec2, t_hat2: Vec2) -> (CubicBezier, f32) {
     let n = pts.len();
     // Self-defensive against degenerate windows so callers don't have to rely on upstream
     // invariants: <2 points has no chord to fit, so synthesize a tiny straight cubic.
@@ -476,8 +729,6 @@ fn fit_cubic_lsq(pts: &[Vec2]) -> (CubicBezier, f32) {
     if n == 2 {
         return (straight_cubic(p0, p3), 0.0);
     }
-    let t_hat1 = start_tangent(pts);
-    let t_hat2 = end_tangent(pts);
 
     let mut u = centripetal_params(pts);
     let mut curve = solve_handles(pts, &u, p0, p3, t_hat1, t_hat2);
@@ -485,6 +736,63 @@ fn fit_cubic_lsq(pts: &[Vec2]) -> (CubicBezier, f32) {
     curve = solve_handles(pts, &u, p0, p3, t_hat1, t_hat2);
 
     (curve, max_error(pts, &curve, &u))
+}
+
+/// Forward unit tangent of the polyline centred at `idx`, from a short symmetric chord. Used as
+/// the *shared* direction at a smooth interior anchor so the two cubics meeting there are C1.
+fn tangent_dir_at(pts: &[Vec2], idx: usize) -> Vec2 {
+    let n = pts.len();
+    if n < 2 {
+        return Vec2::X;
+    }
+    let k = 3.min(idx).min(n - 1 - idx).max(1);
+    safe_dir(pts[(idx + k).min(n - 1)] - pts[idx.saturating_sub(k)], Vec2::X)
+}
+
+/// Fit one cubic per `[bps[i], bps[i+1]]` window, made C1 at every smooth interior join: the two
+/// cubits sharing a smooth anchor are fit with a single shared tangent *direction* there, so the
+/// join is tangent-continuous while each window's handle *lengths* are still chosen by the
+/// least-squares solve. Corners (per the `corner` mask) and the stroke endpoints use
+/// window-local tangents so corners stay sharp. `start_override` / `end_override`, when set,
+/// force the forward tangent direction at the first window's start / last window's end — the
+/// incremental fitter uses them to stay C1 with already-committed geometry.
+fn fit_windows_c1(
+    pts: &[Vec2],
+    bps: &[usize],
+    corner: &[bool],
+    start_override: Option<Vec2>,
+    end_override: Option<Vec2>,
+) -> Vec<CubicBezier> {
+    let m = bps.len().saturating_sub(1);
+    let mut segs = Vec::with_capacity(m);
+    for i in 0..m {
+        let (lo, hi) = (bps[i], bps[i + 1]);
+        let win = &pts[lo..=hi];
+        let is_corner = |idx: usize| corner.get(idx).copied().unwrap_or(false);
+
+        // Start tangent (forward). First window: an override (committed boundary) wins, else the
+        // stroke start uses a window-local tangent. A corner uses the window-local tangent (sharp);
+        // a smooth interior anchor uses the shared centred direction (C1 with the previous window).
+        let t1 = if i == 0 {
+            start_override.unwrap_or_else(|| start_tangent(win))
+        } else if is_corner(lo) {
+            start_tangent(win)
+        } else {
+            tangent_dir_at(pts, lo)
+        };
+
+        // End tangent (backward, per `solve_handles`). Symmetric to the start.
+        let t2 = if i == m - 1 {
+            end_override.map(|d| -d).unwrap_or_else(|| end_tangent(win))
+        } else if is_corner(hi) {
+            end_tangent(win)
+        } else {
+            -tangent_dir_at(pts, hi)
+        };
+
+        segs.push(fit_cubic_lsq_with_tangents(win, t1, t2).0);
+    }
+    segs
 }
 
 /// Unit tangent leaving the first point, averaged over a few early samples to damp jitter.
@@ -611,19 +919,20 @@ fn max_error(pts: &[Vec2], curve: &CubicBezier, u: &[f32]) -> f32 {
 //
 // Within a span between hard anchors the windows are grown greedily from the start, so once a
 // window closes (the next one begins) its breakpoint is fixed by points local to it —
-// appending samples at the cursor never moves it. Corner joins are left with independent
-// tangents (see `smooth_interior_joins`), so a cubic *before* a corner is independent of
-// everything after it. We therefore **commit** (freeze) every window except the last one or
-// two near the cursor and only re-fit that short open tail. A `max_window` cap forces a commit
-// on long straight/corner-free runs that would otherwise keep one window open forever.
+// appending samples at the cursor never moves it. Smooth joins are made C1 by fitting each
+// window with a shared tangent direction at the anchor (see `fit_windows_c1`), computed from
+// points local to that anchor, so a committed cubic is independent of everything far ahead. We
+// therefore **commit** (freeze) every window except the last one near the cursor and only re-fit
+// that short open tail. A `max_window` cap forces a commit on long straight/corner-free runs that
+// would otherwise keep one window open forever.
 //
 // Commit protocol, so frozen geometry never has to change:
 //   * the *last* window stays open (it ends at the moving cursor and re-fits every push);
-//   * a window is frozen only once a later window exists, so its forward join is already
-//     smoothed (`smooth_interior_joins` touches both sides of a smooth join);
-//   * at the boundary between committed and open we apply a *one-sided* smoothing — rotate
-//     only the open side's handle to match the frozen tangent — so the committed cubic is
-//     never touched while the join stays visually C1. Corner boundaries are left alone.
+//   * a window is frozen only once a later window exists, so its forward tangent is already
+//     anchored by local points;
+//   * at the boundary between committed and open the open side is fit with a `start_override`
+//     tangent that leaves along the frozen cubic's outgoing direction, so the committed cubic is
+//     never touched while the join stays C1. Corner boundaries are left independent.
 
 /// Live, incremental counterpart to [`fit_polyline_adaptive`]. Feed raw pointer points one at
 /// a time with [`Self::push_point`]; read the current fit with [`Self::skeleton`]. Per-point
@@ -721,8 +1030,8 @@ impl IncrementalAdaptiveFit {
     /// Re-fit the open region `pts[committed_at..]` (plus the provisional cursor tip), then
     /// freeze every window except the last.
     fn refit_open(&mut self) {
-        let tol = self.params.tolerance.max(1e-3);
-        let max_turn = self.params.max_turn.max(0.05);
+        let tol = self.params.effective_tolerance();
+        let max_turn = self.params.effective_max_turn();
         let corner_turn = self.params.corner_turn.max(0.05);
 
         // Open input: the uncommitted resampled samples plus the live cursor as a provisional
@@ -742,32 +1051,34 @@ impl IncrementalAdaptiveFit {
             return;
         }
 
-        let turn = turning_angles(&open_in);
+        let turn = self.params.budget_turning(&open_in);
         let corner = detect_corners(&open_in, corner_turn);
-        let bps = adaptive_breakpoints(&open_in, &turn, &corner, max_turn, tol, Self::MAX_WINDOW);
+        let extrema = self.params.curvature_extrema(&open_in);
+        let bps = adaptive_breakpoints(
+            &open_in,
+            &turn,
+            &corner,
+            &extrema,
+            max_turn,
+            tol,
+            Self::MAX_WINDOW,
+        );
 
-        // One cubic per window, then smooth interior joins (corners left independent).
-        let mut segs: Vec<CubicBezier> = bps
-            .windows(2)
-            .map(|w| fit_cubic_lsq(&open_in[w[0]..=w[1]]).0)
-            .collect();
+        // One cubic per window, C1 across smooth interior joins by construction. At the committed
+        // boundary, force the open side's start tangent to leave along the frozen cubic's outgoing
+        // direction, so the join stays C1 without touching the committed cubic.
+        let start_override = if self.boundary_corner {
+            None
+        } else {
+            self.committed
+                .last()
+                .map(|last| safe_dir(open_in[0] - last.p2, Vec2::X))
+        };
+        let mut segs = fit_windows_c1(&open_in, &bps, &corner, start_override, None);
         if segs.is_empty() {
             self.open.clear();
             self.open_corner.clear();
             return;
-        }
-        smooth_interior_joins(&mut segs, &bps, &corner);
-        // One-sided smoothing at the committed boundary: align only the open side to the frozen
-        // outgoing tangent so the committed cubic is untouched but the join stays C1.
-        if !self.boundary_corner {
-            if let Some(last) = self.committed.last() {
-                let anchor = segs[0].p0;
-                let tang = (anchor - last.p2).normalize_or_zero();
-                if tang.length_squared() > 0.0 {
-                    let len_out = (segs[0].p1 - anchor).length();
-                    segs[0].p1 = anchor + tang * len_out;
-                }
-            }
         }
 
         // Per-window start-anchor corner flags (index 0 is the committed/open boundary).
@@ -907,6 +1218,265 @@ mod tests {
             fit.push_point(p);
         }
         fit
+    }
+
+    /// A sine wave of `periods` full cycles spanning `len` px in x with amplitude `amp`. Its
+    /// curvature peaks at each crest/trough and falls to zero at the zero-crossings — the canonical
+    /// case for the curvature-extrema anchor bias.
+    fn sine_wave(periods: f32, n: usize, amp: f32, len: f32) -> Vec<Vec2> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / (n - 1) as f32;
+                let x = t * len;
+                let y = amp * (t * periods * std::f32::consts::TAU).sin();
+                Vec2::new(x, y)
+            })
+            .collect()
+    }
+
+    /// The x of the k-th sine extremum (crest or trough) for `periods` cycles over `len`: the
+    /// quarter-phase offsets where `sin` reaches ±1.
+    fn sine_extremum_x(k: usize, periods: f32, len: f32) -> f32 {
+        // sin peaks at phase (k + 0.5)·π for k = 0, 1, 2, ... → t = (k + 0.5) / (2·periods).
+        (k as f32 + 0.5) / (2.0 * periods) * len
+    }
+
+    #[test]
+    fn soft_fit_pins_anchors_at_sine_peaks_and_troughs() {
+        // Two full periods (300px each), steep enough that each crest/trough is a clear curvature
+        // extremum: four interior extrema in all.
+        let periods = 2.0;
+        let len = 600.0;
+        let amp = 60.0;
+        let pts = sine_wave(periods, 400, amp, len);
+
+        let strict = fit_polyline_adaptive(
+            &pts,
+            &AdaptiveFitParams {
+                smoothness: 0.0,
+                ..AdaptiveFitParams::default()
+            },
+        );
+        let soft = fit_polyline_adaptive(
+            &pts,
+            &AdaptiveFitParams {
+                smoothness: 1.0,
+                ..AdaptiveFitParams::default()
+            },
+        );
+
+        // Softening never adds anchors: it pins the extrema and relaxes the budget that would
+        // otherwise scatter extra splits along each arc.
+        assert!(
+            soft.anchor_count() <= strict.anchor_count(),
+            "soft fit ({}) should be no denser than strict ({})",
+            soft.anchor_count(),
+            strict.anchor_count()
+        );
+
+        let extrema_x: Vec<f32> = (0..4).map(|k| sine_extremum_x(k, periods, len)).collect();
+
+        // (1) Every crest/trough has a soft-fit anchor sitting on it (within a few px of the apex).
+        for (k, &ex) in extrema_x.iter().enumerate() {
+            let near =
+                (0..soft.anchor_count()).any(|j| (soft.anchor_position(j).x - ex).abs() < 12.0);
+            assert!(near, "expected a soft-fit anchor near sine extremum #{k} at x≈{ex}");
+        }
+
+        // (2) ...and *nowhere else*: every interior soft anchor lies on a crest/trough, so the fit
+        //     is exactly the user's spec — an anchor at the start, at each trough and peak, and
+        //     between them nothing. (The two endpoints are excluded from this interior check.)
+        for j in 1..soft.anchor_count() - 1 {
+            let ax = soft.anchor_position(j).x;
+            let on_extremum = extrema_x.iter().any(|&ex| (ax - ex).abs() < 12.0);
+            assert!(
+                on_extremum,
+                "interior soft anchor #{j} at x≈{ax} is not on any sine extremum"
+            );
+        }
+
+        // (3) And the curve still hugs the input — pinning anchors at the apexes does not sacrifice fit.
+        assert!(
+            max_dev_to_skeleton(&soft, &pts) < 6.0,
+            "soft fit deviates too far: {}",
+            max_dev_to_skeleton(&soft, &pts)
+        );
+    }
+
+    /// Deterministic pseudo-random in `[0,1)` (the classic GLSL hash), so noise tests are
+    /// reproducible without an RNG dependency.
+    fn hash01(i: usize, salt: usize) -> f32 {
+        let x = ((i as f32 + salt as f32 * 0.123) * 12.9898).sin() * 43758.547;
+        x - x.floor()
+    }
+
+    /// A circular arc (constant true curvature) perturbed by per-sample noise of amplitude
+    /// `noise` px — a stand-in for a hand-drawn curve, where every sample wiggles.
+    fn noisy_arc(n: usize, sweep: f32, radius: f32, noise: f32) -> Vec<Vec2> {
+        (0..n)
+            .map(|i| {
+                let a = i as f32 / (n - 1) as f32 * sweep;
+                let base = Vec2::new(radius * a.cos(), radius * a.sin());
+                let dx = (hash01(i, 1) - 0.5) * 2.0 * noise;
+                let dy = (hash01(i, 2) - 0.5) * 2.0 * noise;
+                base + Vec2::new(dx, dy)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn soft_fit_gives_one_anchor_per_bend_not_a_cluster() {
+        // The reported regression: drawing through a curvature change sprinkled a cluster of
+        // anchors. A noisy circular arc is the worst case — constant true curvature (no genuine
+        // apex anywhere), so a correct soft fit must NOT pin a row of extrema along it; jitter
+        // alone used to spawn one every few samples.
+        let pts = noisy_arc(220, 1.4 * std::f32::consts::PI, 130.0, 2.5);
+        let soft = fit_polyline_adaptive(
+            &pts,
+            &AdaptiveFitParams {
+                smoothness: 1.0,
+                ..AdaptiveFitParams::default()
+            },
+        );
+        // A ~250° arc needs only a handful of cubics; anything approaching the input density
+        // (hundreds of samples) means the jitter is leaking through as false extrema.
+        assert!(
+            soft.anchor_count() <= 8,
+            "noisy arc over-segmented into {} anchors (clustering regression)",
+            soft.anchor_count()
+        );
+        // And it still tracks the arc through the noise (a soft fit rides over jitter, so the
+        // bound is loose — this only guards against the fit wandering off the arc entirely).
+        assert!(
+            max_dev_to_skeleton(&soft, &pts) < 12.0,
+            "soft fit of noisy arc deviates too far: {}",
+            max_dev_to_skeleton(&soft, &pts)
+        );
+    }
+
+    #[test]
+    fn soft_fit_survives_a_noisy_sine() {
+        // The user's actual case: a curvy stroke with hand jitter. Each crest/trough should get
+        // ONE anchor, not a knot of them.
+        let periods = 2.0;
+        let len = 600.0;
+        let amp = 60.0;
+        let clean = sine_wave(periods, 400, amp, len);
+        let pts: Vec<Vec2> = clean
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                p + Vec2::new(
+                    (hash01(i, 3) - 0.5) * 2.0 * 1.5,
+                    (hash01(i, 4) - 0.5) * 2.0 * 1.5,
+                )
+            })
+            .collect();
+        let soft = fit_polyline_adaptive(
+            &pts,
+            &AdaptiveFitParams {
+                smoothness: 1.0,
+                ..AdaptiveFitParams::default()
+            },
+        );
+        // Four interior extrema + two endpoints, give or take one stray from the noise — not the
+        // dozens a clustering bug would produce.
+        assert!(
+            soft.anchor_count() <= 8,
+            "noisy sine over-segmented into {} anchors",
+            soft.anchor_count()
+        );
+        // Each crest/trough still has an anchor near it.
+        for k in 0..4 {
+            let ex = sine_extremum_x(k, periods, len);
+            let near =
+                (0..soft.anchor_count()).any(|j| (soft.anchor_position(j).x - ex).abs() < 18.0);
+            assert!(near, "expected an anchor near noisy-sine extremum #{k} at x≈{ex}");
+        }
+    }
+
+    #[test]
+    fn hook_at_default_smoothness_is_sparse() {
+        // The screenshot case: a single hook/U-turn drawn with hand jitter. The whole bend should
+        // collapse to roughly one anchor at the apex plus the two endpoints — a small handful,
+        // not the dozen the budget produced when it was integrating jitter. Tested at the *default*
+        // tool smoothness (0.5), since that is what the user draws with out of the box.
+        let pts = noisy_arc(200, std::f32::consts::PI, 130.0, 2.5); // a 180° hook
+        let fit = fit_polyline_adaptive(
+            &pts,
+            &AdaptiveFitParams {
+                smoothness: 0.5,
+                ..AdaptiveFitParams::default()
+            },
+        );
+        assert!(
+            fit.anchor_count() <= 5,
+            "hook over-segmented into {} anchors at default smoothness",
+            fit.anchor_count()
+        );
+        // It still follows the hook (loose, since this is a softened fit).
+        assert!(
+            max_dev_to_skeleton(&fit, &pts) < 10.0,
+            "hook fit wanders off: {}",
+            max_dev_to_skeleton(&fit, &pts)
+        );
+    }
+
+    #[test]
+    fn rounded_bend_gets_one_centred_apex_anchor() {
+        // A rounded corner: a horizontal lead-in, a quarter-circle turn, then a vertical lead-out.
+        // The curvature is a flat-topped plateau across the arc, which used to surface *two*
+        // anchors at the plateau's shoulders, straddling the apex. The hump should now collapse to
+        // a single anchor at the apex (the arc's 45° midpoint).
+        let r = 90.0;
+        let mut pts = Vec::new();
+        // Lead-in: horizontal, approaching the arc start at (0, r).
+        for i in 0..=40 {
+            pts.push(Vec2::new(-160.0 + i as f32 * 4.0, r));
+        }
+        // Quarter arc, centre (0,0): from angle 90° down to 0°, apex at 45°.
+        let arc_apex = {
+            let mut apex = Vec2::ZERO;
+            for i in 0..=40 {
+                let a = std::f32::consts::FRAC_PI_2 * (1.0 - i as f32 / 40.0);
+                let p = Vec2::new(r * a.cos(), r * a.sin());
+                if i == 20 {
+                    apex = p;
+                }
+                pts.push(p);
+            }
+            apex
+        };
+        // Lead-out: vertical, descending from the arc end at (r, 0).
+        for i in 1..=40 {
+            pts.push(Vec2::new(r, -(i as f32 * 4.0)));
+        }
+
+        let fit = fit_polyline_adaptive(
+            &pts,
+            &AdaptiveFitParams {
+                smoothness: 0.6,
+                ..AdaptiveFitParams::default()
+            },
+        );
+        // Exactly one anchor should sit in the apex neighbourhood — not a straddling pair.
+        let near_apex: Vec<Vec2> = (0..fit.anchor_count())
+            .map(|j| fit.anchor_position(j))
+            .filter(|p| (*p - arc_apex).length() < r * 0.6)
+            .collect();
+        assert_eq!(
+            near_apex.len(),
+            1,
+            "expected a single apex anchor, got {} near the bend: {:?}",
+            near_apex.len(),
+            near_apex
+        );
+        // And it should be close to the true apex, not off on a shoulder.
+        assert!(
+            (near_apex[0] - arc_apex).length() < 22.0,
+            "apex anchor landed {:.1}px from the apex",
+            (near_apex[0] - arc_apex).length()
+        );
     }
 
     /// A smooth S-curve, no hard corners.

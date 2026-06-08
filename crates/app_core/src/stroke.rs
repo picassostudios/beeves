@@ -23,6 +23,12 @@ const SIGMA_NORMAL_FILL_FACTOR: f32 = 0.15;
 /// perimeter while the interior stays soft.
 const SIGMA_NORMAL_EDGE_FACTOR: f32 = 0.10;
 
+/// Serde default for [`GaussianBezierStroke::blend_strength`] (full-strength smear), so strokes
+/// saved before the field existed load with a sensible value.
+fn default_blend_strength() -> f32 {
+    1.0
+}
+
 /// Policy controlling how the two views synchronize.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct SyncPolicy {
@@ -82,6 +88,20 @@ pub struct GaussianBezierStroke {
     /// renderer just skips them for this stroke and draws the path. Set by the vector-draw tool.
     #[serde(default)]
     pub render_as_vector: bool,
+    /// When true the stroke is a *vector blend* path: it carries no colour of its own. Instead
+    /// the renderer draws it in a dedicated pass (`renderer::vector_blend`) that samples the
+    /// vector-stroke layer beneath the ribbon and directionally smears those colours along the
+    /// path tangent — a live, non-destructive smudge whose region is described by a vector. This
+    /// implies `render_as_vector` for the splat passes (both are set together), so the stroke's
+    /// splats are still generated and kept for hit-testing / direct-edit but never drawn as a
+    /// splat cloud or a solid ribbon. Set by the vector-blend tool.
+    #[serde(default)]
+    pub vector_blend: bool,
+    /// Strength of the vector-blend smear in `[0,1]`: the opacity with which the smeared result
+    /// is composited over the layer beneath the ribbon (0 = invisible, 1 = full smear). Only
+    /// meaningful when `vector_blend` is set.
+    #[serde(default = "default_blend_strength")]
+    pub blend_strength: f32,
     #[serde(skip)]
     pub dirty_flags: StrokeDirtyFlags,
     /// Monotonic allocator for splat ids within this stroke.
@@ -100,6 +120,8 @@ impl GaussianBezierStroke {
             splats: Vec::new(),
             sync: SyncPolicy::default(),
             render_as_vector: false,
+            vector_blend: false,
+            blend_strength: default_blend_strength(),
             dirty_flags: StrokeDirtyFlags::default(),
             next_splat_id: 0,
         };

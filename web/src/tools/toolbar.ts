@@ -9,6 +9,7 @@
 export type ToolName =
   | "brush"
   | "vectordraw"
+  | "vectorblend"
   | "bezier"
   | "edit"
   | "sculpt"
@@ -18,6 +19,7 @@ export type ToolName =
 export const TOOLS: readonly ToolName[] = [
   "brush",
   "vectordraw",
+  "vectorblend",
   "bezier",
   "edit",
   "sculpt",

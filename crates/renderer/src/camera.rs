@@ -7,7 +7,9 @@ use glam::Vec2;
 ///
 /// `params` carries auxiliary scalars in a 16-byte-aligned slot so the Rust↔WGSL layout
 /// stays byte-identical (a bare trailing `f32` would mismatch std140/wgsl vec4 alignment).
-/// `params.x` = `zoom` (pixels-per-world-unit), consumed by the screen-space low-pass.
+/// `params.x` = `zoom` (pixels-per-world-unit), consumed by the screen-space low-pass;
+/// `params.zw` = the render-target size in physical pixels, used by the vector-blend pass to
+/// convert a fragment's screen position to a texture coordinate. `params.y` is reserved.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniform {
@@ -45,8 +47,9 @@ impl Camera2D {
         CameraUniform {
             scale: scale.into(),
             offset: offset.into(),
-            // params.x = zoom (pixels-per-world-unit); remaining lanes reserved.
-            params: [self.zoom, 0.0, 0.0, 0.0],
+            // params.x = zoom (pixels-per-world-unit); params.zw = render-target size in
+            // physical pixels (for the vector-blend pass); params.y reserved.
+            params: [self.zoom, 0.0, w, h],
         }
     }
 

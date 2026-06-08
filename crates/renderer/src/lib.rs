@@ -15,6 +15,7 @@ pub mod pipelines;
 pub mod scene;
 pub mod triangle;
 pub mod vector;
+pub mod vector_blend;
 
 pub use camera::{Camera2D, CameraUniform};
 pub use convex::ConvexUniform;
@@ -22,6 +23,7 @@ pub use gpu::GpuContext;
 pub use scene::SceneLayout;
 pub use triangle::TriangleUniform;
 pub use vector::{VectorPathPipeline, VectorVertex};
+pub use vector_blend::{VectorBlendPipeline, VectorBlendVertex};
 
 use app_core::document::Document;
 use app_core::splat::GpuSplat;
@@ -87,6 +89,11 @@ pub struct SplatRenderer {
     vector: VectorPathPipeline,
     /// Reused per-frame tessellation scratch so the vector pass never allocates.
     vector_scratch: Vec<VectorVertex>,
+    /// Vector-blend (directional smear) pipelines + offscreen vector layer + smear vertex buffer.
+    /// Used to draw `vector_blend` strokes, which sample the plain vector layer beneath them.
+    vector_blend: VectorBlendPipeline,
+    /// Reused per-frame smear tessellation scratch so the blend pass never allocates.
+    blend_scratch: Vec<VectorBlendVertex>,
 }
 
 impl SplatRenderer {
@@ -98,6 +105,7 @@ impl SplatRenderer {
         let triangle = TriangleSplatPipeline::new(device, target_format);
         let triangle_accum = TriangleAccumPipeline::new(device);
         let vector = VectorPathPipeline::new(device, target_format);
+        let vector_blend = VectorBlendPipeline::new(device, target_format);
         let splats = SplatBuffer::new(device, &[]);
         let camera_buffer = buffers::camera_buffer(device, &CameraUniform::default());
         let convex_buffer = buffers::convex_buffer(device, &ConvexUniform::default());
@@ -120,6 +128,8 @@ impl SplatRenderer {
             resident_capacity,
             vector,
             vector_scratch: Vec::new(),
+            vector_blend,
+            blend_scratch: Vec::new(),
         }
     }
 
@@ -268,12 +278,19 @@ impl SplatRenderer {
         );
     }
 
-    /// Draw every `render_as_vector` stroke in `doc` as a conventional, antialiased stroked
-    /// path, composited on top of whatever is already in `view` (it **loads**, never clears).
-    /// Tessellates the stroked ribbons on the CPU each frame — vector strokes are few, clean
-    /// line art — uploads them, and issues a single mesh draw. Call *after* the splat pass
-    /// (which clears + draws the splat field) and before presenting; a document with no vector
-    /// strokes is a no-op (no pass is encoded).
+    /// Draw the document's vector strokes on top of whatever is already in `view` (it **loads**,
+    /// never clears). Two kinds of vector stroke are handled:
+    ///
+    ///   * plain `render_as_vector` strokes — tessellated, antialiased stroked paths;
+    ///   * `vector_blend` strokes — ribbons that carry no colour of their own and instead
+    ///     directionally smear the plain vector layer beneath them (see [`crate::vector_blend`]).
+    ///
+    /// When the document has no blend strokes this is the cheap single-pass path (draw the plain
+    /// vectors straight onto the view). When it does, the plain vectors are first rendered into an
+    /// offscreen layer so the smear pass can sample them: render layer → blit layer onto view →
+    /// draw the smear ribbons sampling the layer. Tessellation runs on the CPU each frame (vector
+    /// strokes are few, clean line art). Call *after* the splat pass and before presenting; a
+    /// document with no vector strokes of either kind is a no-op (no pass is encoded).
     pub fn render_vector_paths(
         &mut self,
         device: &wgpu::Device,
@@ -284,21 +301,39 @@ impl SplatRenderer {
     ) {
         let zoom = camera.params[0];
         vector::tessellate_document(doc, zoom, &mut self.vector_scratch);
-        if self.vector_scratch.is_empty() {
+        vector_blend::tessellate_blend_document(doc, zoom, &mut self.blend_scratch);
+        let has_vectors = !self.vector_scratch.is_empty();
+        let has_blend = !self.blend_scratch.is_empty();
+        if !has_vectors && !has_blend {
             return;
         }
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(camera));
+
+        if !has_blend {
+            // Fast path: no smear strokes, so draw the plain vectors directly onto the view.
+            self.vector.upload(device, queue, &self.vector_scratch);
+            self.encode_vector_only(device, queue, view);
+            return;
+        }
+
+        // Smear strokes present: the plain vector layer must live in a sampleable texture. Size
+        // the offscreen layer to the render target (carried in the camera uniform's params.zw).
+        let w = camera.params[2].max(1.0) as u32;
+        let h = camera.params[3].max(1.0) as u32;
+        self.vector_blend.ensure(device, w, h);
         self.vector.upload(device, queue, &self.vector_scratch);
+        self.vector_blend.upload(device, queue, &self.blend_scratch);
+        self.encode_blend(device, queue, view, has_vectors);
+    }
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vector bind group"),
-            layout: &self.vector.bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: self.camera_buffer.as_entire_binding(),
-            }],
-        });
-
+    /// Single-pass plain-vector draw: composite the tessellated ribbons onto `view` (load).
+    fn encode_vector_only(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+    ) {
+        let bind_group = self.vector_camera_bind_group(device);
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("vector encoder"),
         });
@@ -325,6 +360,141 @@ impl SplatRenderer {
             rpass.draw(0..self.vector.vertex_count(), 0..1);
         }
         queue.submit(Some(encoder.finish()));
+    }
+
+    /// Four-pass smear draw: (1) render the plain vectors into the offscreen layer, (2) blit the
+    /// layer onto `view`, (3) accumulate the blend ribbons into the offscreen mask (additive
+    /// direction + weight), (4) resolve the mask against the layer once and composite the smear
+    /// onto `view`. Buffers must already be uploaded and the targets sized via
+    /// [`vector_blend::VectorBlendPipeline::ensure`].
+    fn encode_blend(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        has_vectors: bool,
+    ) {
+        let layer = self.vector_blend.layer_view();
+        let mask = self.vector_blend.mask_view();
+        let vec_bind_group = self.vector_camera_bind_group(device);
+        let blit_bind_group = self.vector_blend.blit_bind_group(device, layer);
+        let accum_bind_group = self.vector_blend.accum_bind_group(device, &self.camera_buffer);
+        let resolve_bind_group = self.vector_blend.resolve_bind_group(device, &self.camera_buffer);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("vector blend encoder"),
+        });
+
+        // Pass 1: plain vectors -> offscreen layer (cleared transparent so untouched texels read
+        // as empty for the smear taps).
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("vector layer pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: layer,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            if has_vectors {
+                rpass.set_pipeline(&self.vector.pipeline);
+                rpass.set_bind_group(0, &vec_bind_group, &[]);
+                rpass.set_vertex_buffer(0, self.vector.buffer().slice(..));
+                rpass.draw(0..self.vector.vertex_count(), 0..1);
+            }
+        }
+
+        // Pass 2: blit the layer onto the view so the plain vectors still appear.
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("vector blit pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(self.vector_blend.blit_pipeline());
+            rpass.set_bind_group(0, &blit_bind_group, &[]);
+            rpass.draw(0..3, 0..1);
+        }
+
+        // Pass 3: accumulate the blend ribbons into the mask (additive, cleared transparent).
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("vector blend accum pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: mask,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(self.vector_blend.accum_pipeline());
+            rpass.set_bind_group(0, &accum_bind_group, &[]);
+            rpass.set_vertex_buffer(0, self.vector_blend.buffer().slice(..));
+            rpass.draw(0..self.vector_blend.vertex_count(), 0..1);
+        }
+
+        // Pass 4: resolve the mask against the layer once and composite the smear onto the view.
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("vector blend resolve pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rpass.set_pipeline(self.vector_blend.resolve_pipeline());
+            rpass.set_bind_group(0, &resolve_bind_group, &[]);
+            rpass.draw(0..3, 0..1);
+        }
+
+        queue.submit(Some(encoder.finish()));
+    }
+
+    /// Bind group for the plain-vector pipeline: just the shared camera uniform at binding 0.
+    fn vector_camera_bind_group(&self, device: &wgpu::Device) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vector bind group"),
+            layout: &self.vector.bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.camera_buffer.as_entire_binding(),
+            }],
+        })
     }
 
     /// Drop resident scene state. Call when the document is replaced wholesale (e.g. on

@@ -36,6 +36,12 @@ enum Tool {
     /// the fitted segments (one per adaptive *window*) are highlighted in red via
     /// [`WasmApp::vector_overlay`].
     VectorDraw,
+    /// Vector-blend tool: captured exactly like [`Tool::VectorDraw`] (the same freehand,
+    /// curvature-adaptive fit), but the committed stroke is a *blend* path — it carries no colour
+    /// and instead directionally smears the vector-stroke layer beneath it (see
+    /// `renderer::vector_blend`). A live, non-destructive smudge described by a vector, distinct
+    /// from the gaussian [`Tool::Blend`] which destructively rewrites splat colours.
+    VectorBlend,
     Bezier,
     /// Direct-edit (node) tool: select a stroke, then drag its anchors and tangent
     /// handles — Illustrator's Direct-Selection / vector tool.
@@ -52,6 +58,7 @@ impl Tool {
     fn from_str(s: &str) -> Tool {
         match s {
             "vectordraw" => Tool::VectorDraw,
+            "vectorblend" => Tool::VectorBlend,
             "bezier" => Tool::Bezier,
             "edit" => Tool::Edit,
             "sculpt" => Tool::Sculpt,
@@ -61,6 +68,18 @@ impl Tool {
             _ => Tool::Brush,
         }
     }
+}
+
+/// How a live preview / committed stroke is rendered, chosen by the tool that builds it. The
+/// three kinds map onto the stroke flags consumed by the renderer (see [`apply_preview_kind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewKind {
+    /// Gaussian splat cloud (brush / pen): `render_as_vector = false`.
+    Splat,
+    /// Plain tessellated vector path (vector-draw): `render_as_vector = true`.
+    Vector,
+    /// Vector-blend smear path (vector-blend): `render_as_vector = true`, `vector_blend = true`.
+    Blend,
 }
 
 /// Which kernel the renderer draws splats with. This is *orthogonal* to the active tool and to
@@ -182,6 +201,10 @@ pub struct WasmApp {
     brush_edge_hardness: f32,
     /// Blend tool strength: fraction toward the carried/region paint applied per blend dab.
     blend_strength: f32,
+    /// Vector-blend tool strength in `[0,1]`: the smear opacity stamped onto new blend strokes
+    /// (`GaussianBezierStroke::blend_strength`). Distinct from `blend_strength` (the gaussian
+    /// smudge tool's per-dab fraction).
+    vector_blend_strength: f32,
     /// The blend (smudge) brush's carried appearance, so colour transports along a drag.
     /// Reset at the start of each blend stroke (on pointer_down).
     blend_carry: BlendCarry,
@@ -206,6 +229,11 @@ pub struct WasmApp {
     /// Triangle splat UI window smoothness in `[0,1]`: 0 = a solid, hard-edged triangle, 1 =
     /// soft/peaked falloff. Maps to the Triangle Splatting paper's σ by [`triangle_sigma`].
     tri_softness: f32,
+    /// Vector-draw curve-fit softness in `[0,1]` (the curvature-adaptive fitter's `smoothness`):
+    /// 0 = strict, hug-the-input tracking; 1 = anchors pinned only at curvature extrema (the
+    /// apex of each bend — a sine's peaks and troughs) with the budget relaxed between them. See
+    /// `app_core::fitting::AdaptiveFitParams::smoothness`.
+    vector_smoothness: f32,
 }
 
 #[wasm_bindgen]
@@ -326,6 +354,7 @@ impl WasmApp {
             brush_hardness: BrushModel::default().hardness,
             brush_edge_hardness: BrushModel::default().edge_hardness,
             blend_strength: 0.5,
+            vector_blend_strength: 1.0,
             blend_carry: BlendCarry::default(),
             crisp_edges: true,
             render_mode: RenderMode::Gaussian,
@@ -334,6 +363,9 @@ impl WasmApp {
             convex_sharpness,
             tri_rotation,
             tri_softness,
+            // Default to a moderately soft fit so the tool biases anchors toward curvature
+            // extrema out of the box; the "Curve" slider tunes it.
+            vector_smoothness: 0.5,
         })
     }
 
@@ -446,7 +478,7 @@ impl WasmApp {
             Tool::Brush => {
                 self.pointer.polyline.push(world);
             }
-            Tool::VectorDraw => {
+            Tool::VectorDraw | Tool::VectorBlend => {
                 // Same freehand capture as the brush; the fitter differs (see pointer_move).
                 // Clear the previous stroke's window highlight so a new gesture starts clean.
                 self.vector_viz = None;
@@ -536,7 +568,7 @@ impl WasmApp {
                 // stroke so it tracks the cursor as the user draws.
                 self.brush_rebuild_preview();
             }
-            Tool::VectorDraw => {
+            Tool::VectorDraw | Tool::VectorBlend => {
                 self.pointer.polyline.push(world);
                 // Feed the incremental fitter one point; it commits settled windows and re-fits
                 // only the open tail, so this stays cheap no matter how long the stroke gets.
@@ -611,7 +643,7 @@ impl WasmApp {
             }
         }
 
-        if self.tool == Tool::VectorDraw {
+        if matches!(self.tool, Tool::VectorDraw | Tool::VectorBlend) {
             if self.pointer.polyline.last() != Some(&world) {
                 self.pointer.polyline.push(world);
                 if let Some(fit) = self.vector_fit.as_mut() {
@@ -945,10 +977,36 @@ impl WasmApp {
         self.push_triangle_params();
     }
 
+    /// Set the vector-draw curve-fit softness in `[0,1]`: 0 = strict (hug the input, anchors
+    /// wherever the curvature-adaptive budget dictates), 1 = soft (anchors pinned at curvature
+    /// extrema — the apex of each bend, e.g. a sine's peaks and troughs — and nowhere else).
+    /// Applies to the vector-draw and vector-blend tools; the incremental fitter captures it at
+    /// the start of a stroke, so it takes effect on the next stroke drawn.
+    pub fn set_vector_smoothness(&mut self, smoothness: f32) {
+        self.vector_smoothness = smoothness.clamp(0.0, 1.0);
+    }
+
     /// Set the blend (smudge) tool strength in `[0,1]`: the fraction toward the local
     /// average applied on each blend dab. Higher = faster merging.
     pub fn set_blend_strength(&mut self, strength: f32) {
         self.blend_strength = strength.clamp(0.0, 1.0);
+    }
+
+    /// Set the vector-blend tool's smear strength in `[0,1]`: the opacity with which a blend
+    /// stroke composites its directional smear of the underlying vector layer (0 = invisible,
+    /// 1 = full smear). Applied to blend strokes drawn after this call. If a blend stroke is
+    /// open in the direct-edit tool, its strength is updated live.
+    pub fn set_vector_blend_strength(&mut self, strength: f32) {
+        self.vector_blend_strength = strength.clamp(0.0, 1.0);
+        if self.tool == Tool::Edit {
+            if let Some(sid) = self.edit.target {
+                if let Some(stroke) = self.doc.stroke_mut(sid) {
+                    if stroke.vector_blend {
+                        stroke.blend_strength = self.vector_blend_strength;
+                    }
+                }
+            }
+        }
     }
 
     /// Create a stroke from a flat `[x0,y0,x1,y1,...]` array of **world** coordinates.
@@ -1056,6 +1114,7 @@ impl WasmApp {
         AdaptiveFitParams {
             tolerance: (1.5 / self.camera.zoom).max(0.25),
             resample_step: (3.0 / self.camera.zoom).max(0.75),
+            smoothness: self.vector_smoothness,
             ..AdaptiveFitParams::default()
         }
     }
@@ -1082,7 +1141,7 @@ impl WasmApp {
             return;
         }
         let skeleton = self.fit_brush_skeleton(&self.pointer.polyline);
-        self.set_preview_stroke(skeleton, false);
+        self.set_preview_stroke(skeleton, PreviewKind::Splat);
     }
 
     /// Rebuild (or create) the vector-draw tool's live preview from the in-progress polyline
@@ -1101,41 +1160,41 @@ impl WasmApp {
             Some(fit) => fit.skeleton(),
             None => self.fit_vector_skeleton(&self.pointer.polyline),
         };
-        self.set_preview_stroke(skeleton, true);
+        // The vector-blend tool commits a smear path; the vector-draw tool a plain vector path.
+        let kind = if self.tool == Tool::VectorBlend {
+            PreviewKind::Blend
+        } else {
+            PreviewKind::Vector
+        };
+        self.set_preview_stroke(skeleton, kind);
         self.vector_viz = self.pointer.preview;
     }
 
     /// Update the active preview stroke (`pointer.preview`) to `skeleton` with the current
-    /// brush, creating it on the current layer if it does not exist yet. `as_vector` marks the
-    /// stroke for conventional vector rendering. Shared by the brush and vector-draw previews.
+    /// brush, creating it on the current layer if it does not exist yet. `kind` selects how the
+    /// stroke renders (splat cloud / plain vector / vector-blend smear). Shared by the brush,
+    /// vector-draw, and vector-blend previews.
     ///
-    /// Vector previews are drawn by tessellating the skeleton each frame (the splat path skips
-    /// `render_as_vector` strokes), so their splats are invisible mid-drag. Regenerating the
-    /// whole splat cloud on every pointer move would be pure wasted O(n) work — the dominant
-    /// cost of a long vector stroke — so for vector previews we skip it and only clear the now
-    /// stale splats. The final cloud (needed for hit-testing/editing) is generated once on
-    /// release; see `pointer_up`.
-    fn set_preview_stroke(&mut self, skeleton: BezierSkeleton, as_vector: bool) {
+    /// Vector and blend previews are drawn by tessellating the skeleton each frame (the splat
+    /// path skips `render_as_vector` strokes), so their splats are invisible mid-drag.
+    /// Regenerating the whole splat cloud on every pointer move would be pure wasted O(n) work —
+    /// the dominant cost of a long vector stroke — so for those previews we skip it and only
+    /// clear the now stale splats. The final cloud (needed for hit-testing/editing) is generated
+    /// once on release; see `pointer_up`.
+    fn set_preview_stroke(&mut self, skeleton: BezierSkeleton, kind: PreviewKind) {
         let brush = self.current_brush();
+        let strength = self.vector_blend_strength;
         match self.pointer.preview {
             Some(sid) if self.doc.stroke(sid).is_some() => {
                 let stroke = self.doc.stroke_mut(sid).expect("checked present above");
                 stroke.brush = brush;
                 stroke.skeleton = skeleton;
-                stroke.render_as_vector = as_vector;
-                if as_vector {
-                    stroke.splats.clear();
-                } else {
-                    stroke.regenerate_splats();
-                }
+                apply_preview_kind(stroke, kind, strength);
             }
             _ => {
                 let sid = self.doc.add_stroke(self.layer, skeleton, brush);
                 if let Some(stroke) = self.doc.stroke_mut(sid) {
-                    stroke.render_as_vector = as_vector;
-                    if as_vector {
-                        stroke.splats.clear();
-                    }
+                    apply_preview_kind(stroke, kind, strength);
                 }
                 self.pointer.preview = Some(sid);
             }
@@ -1309,6 +1368,30 @@ fn triangle_rotation_radians(rotation: f32) -> f32 {
 /// triangle (small σ, hard top-hat window), 1 → a soft falloff peaking at the incenter (large σ).
 fn triangle_sigma(softness: f32) -> f32 {
     0.06 + 2.4 * softness.clamp(0.0, 1.0).powf(1.4)
+}
+
+/// Apply a [`PreviewKind`] to `stroke`, setting the render flags the renderer consumes. A splat
+/// stroke regenerates its cloud; vector and blend strokes drop their splats (they render as
+/// tessellated paths) and a blend stroke additionally records its smear `strength`.
+fn apply_preview_kind(stroke: &mut GaussianBezierStroke, kind: PreviewKind, strength: f32) {
+    match kind {
+        PreviewKind::Splat => {
+            stroke.render_as_vector = false;
+            stroke.vector_blend = false;
+            stroke.regenerate_splats();
+        }
+        PreviewKind::Vector => {
+            stroke.render_as_vector = true;
+            stroke.vector_blend = false;
+            stroke.splats.clear();
+        }
+        PreviewKind::Blend => {
+            stroke.render_as_vector = true;
+            stroke.vector_blend = true;
+            stroke.blend_strength = strength;
+            stroke.splats.clear();
+        }
+    }
 }
 
 /// Build a Bezier skeleton from pen anchors. Each consecutive pair becomes one cubic:

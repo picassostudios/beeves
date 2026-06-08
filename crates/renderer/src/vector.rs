@@ -278,11 +278,13 @@ fn disc_segments(radius_px: f32) -> usize {
     (radius_px.ceil() as usize).clamp(8, 48)
 }
 
-/// Tessellate every `render_as_vector` stroke in `doc` into `out` (cleared first).
+/// Tessellate every plain `render_as_vector` stroke in `doc` into `out` (cleared first).
+/// Vector-*blend* strokes (which also set `render_as_vector`) are excluded — they carry no
+/// colour of their own and are drawn by the dedicated smear pass (`crate::vector_blend`).
 pub fn tessellate_document(doc: &Document, zoom: f32, out: &mut Vec<VectorVertex>) {
     out.clear();
     for stroke in doc.strokes.values() {
-        if stroke.render_as_vector {
+        if stroke.render_as_vector && !stroke.vector_blend {
             tessellate_stroke(stroke, zoom, out);
         }
     }

@@ -44,6 +44,30 @@
         background: var(--panel);
         border-bottom: 1px solid var(--panel-border);
         user-select: none;
+        /* The controls can be wider than the window; let the bar scroll horizontally
+           (drag/trackpad/shift-wheel) instead of clipping the right-hand options. */
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: thin;
+        scroll-behavior: smooth;
+        overscroll-behavior-x: contain;
+      }
+
+      /* A slim scrollbar so the bar stays compact (WebKit). */
+      #toolbar::-webkit-scrollbar {
+        height: 6px;
+      }
+      #toolbar::-webkit-scrollbar-thumb {
+        background: var(--panel-border);
+        border-radius: 3px;
+      }
+
+      /* Keep every control at its natural size so the bar overflows (and scrolls) rather
+         than compressing the groups when they don't all fit. */
+      .tools,
+      .group,
+      .sep {
+        flex: 0 0 auto;
       }
 
       .tools {
@@ -116,7 +140,8 @@
       #convex-smoothness-value,
       #convex-sharpness-value,
       #triangle-rotation-value,
-      #triangle-softness-value {
+      #triangle-softness-value,
+      #vector-smoothness-value {
         min-width: 2.5ch;
         text-align: right;
         color: var(--fg);
@@ -200,6 +225,7 @@
         <div class="tools" id="tools">
           <button type="button" data-tool="brush" title="Brush">Brush</button>
           <button type="button" data-tool="vectordraw" title="Vector Draw — adaptive curvature fit (D)">Vector</button>
+          <button type="button" data-tool="vectorblend" title="Vector Blend — a vector path that directionally smears the vector layer beneath it (G)">V.Blend</button>
           <button type="button" data-tool="bezier" title="Pen — place anchors, drag for curves">Pen</button>
           <button type="button" data-tool="edit" title="Edit anchors &amp; handles (A)">Edit</button>
           <button type="button" data-tool="sculpt" title="Sculpt">Sculpt</button>
@@ -273,12 +299,28 @@
           <span id="triangle-softness-value">0.25</span>
         </div>
 
+        <!-- Vector-draw / vector-blend curve-fit controls; shown only for those tools
+             (toggled in main.ts). Curve = fit softness: 0 = strict tracking (anchors wherever
+             the curvature-adaptive budget lands), 1 = anchors pinned at curvature extrema only
+             (the peaks/troughs of each bend). -->
+        <div class="group" id="vector-controls" hidden>
+          <label for="vector-smoothness" title="Curve-fit softness: bias anchors toward curvature extrema (peaks/troughs)">Curve</label>
+          <input type="range" id="vector-smoothness" min="0" max="1" step="0.05" value="0.5" />
+          <span id="vector-smoothness-value">0.50</span>
+        </div>
+
         <div class="sep"></div>
 
         <div class="group">
           <label for="blend-strength">Blend</label>
           <input type="range" id="blend-strength" min="0" max="1" step="0.05" value="0.5" />
           <span id="blend-strength-value">0.50</span>
+        </div>
+
+        <div class="group">
+          <label for="vector-blend-strength" title="Vector-blend smear opacity">V.Blend</label>
+          <input type="range" id="vector-blend-strength" min="0" max="1" step="0.05" value="1" />
+          <span id="vector-blend-strength-value">1.00</span>
         </div>
 
         <div class="sep"></div>

@@ -105,13 +105,32 @@ async function boot(): Promise<void> {
   // Track the active tool locally too: the render loop only paints the vector-edit
   // handle overlay while the Edit tool is active.
   let currentTool: ToolName = "brush";
+  // The curve-fit softness control only applies to the vector tools; show it for them.
+  const vectorControls = mustGet<HTMLDivElement>("vector-controls");
   const toolbar = createToolbar(
     mustGet<HTMLDivElement>("tools"),
     (tool: ToolName) => {
       currentTool = tool;
       app.set_tool(tool);
+      vectorControls.hidden = tool !== "vectordraw" && tool !== "vectorblend";
     },
     "brush"
+  );
+
+  // Let a plain vertical mouse wheel slide the toolbar horizontally when its controls
+  // overflow the window (trackpads and the scrollbar already scroll it natively).
+  const toolbarEl = mustGet<HTMLDivElement>("toolbar");
+  toolbarEl.addEventListener(
+    "wheel",
+    (ev: WheelEvent) => {
+      const overflowing = toolbarEl.scrollWidth > toolbarEl.clientWidth;
+      if (!overflowing || ev.deltaY === 0 || Math.abs(ev.deltaX) > Math.abs(ev.deltaY)) {
+        return;
+      }
+      toolbarEl.scrollLeft += ev.deltaY;
+      ev.preventDefault();
+    },
+    { passive: false }
   );
 
   // --- Vector-edit handle overlay (2D canvas above the WebGPU surface) -------
@@ -256,6 +275,31 @@ async function boot(): Promise<void> {
   blendInput.addEventListener("input", applyBlend);
   applyBlend();
 
+  // --- Vector-blend strength ------------------------------------------------
+  const vBlendInput = mustGet<HTMLInputElement>("vector-blend-strength");
+  const vBlendValue = mustGet<HTMLSpanElement>("vector-blend-strength-value");
+  const applyVectorBlend = (): void => {
+    const strength = Number(vBlendInput.value);
+    vBlendValue.textContent = strength.toFixed(2);
+    app.set_vector_blend_strength(strength);
+  };
+  vBlendInput.addEventListener("input", applyVectorBlend);
+  applyVectorBlend();
+
+  // --- Vector-draw curve-fit softness ---------------------------------------
+  // Biases the curvature-adaptive fitter's anchors toward curvature extrema (the peaks/troughs
+  // of each bend). The `#vector-controls` group is shown only while a vector tool is active
+  // (toggled in the toolbar callback below).
+  const vectorSmoothInput = mustGet<HTMLInputElement>("vector-smoothness");
+  const vectorSmoothValue = mustGet<HTMLSpanElement>("vector-smoothness-value");
+  const applyVectorSmooth = (): void => {
+    const v = Number(vectorSmoothInput.value);
+    vectorSmoothValue.textContent = v.toFixed(2);
+    app.set_vector_smoothness(v);
+  };
+  vectorSmoothInput.addEventListener("input", applyVectorSmooth);
+  applyVectorSmooth();
+
   // --- Save / Load ----------------------------------------------------------
   mustGet<HTMLButtonElement>("save-btn").addEventListener("click", () => {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -352,6 +396,7 @@ async function boot(): Promise<void> {
   const TOOL_KEYS: Record<string, ToolName> = {
     b: "brush",
     d: "vectordraw",
+    g: "vectorblend",
     p: "bezier",
     a: "edit",
     s: "sculpt",
@@ -402,7 +447,7 @@ async function boot(): Promise<void> {
       const dpr = window.devicePixelRatio || 1;
       drawEditOverlay(overlayCtx, app.edit_overlay(), dpr);
       overlayShown = true;
-    } else if (currentTool === "vectordraw") {
+    } else if (currentTool === "vectordraw" || currentTool === "vectorblend") {
       const dpr = window.devicePixelRatio || 1;
       drawVectorOverlay(overlayCtx, app.vector_overlay(), dpr);
       overlayShown = true;
