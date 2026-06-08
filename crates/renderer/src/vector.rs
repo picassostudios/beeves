@@ -182,13 +182,17 @@ impl VectorPathPipeline {
 /// curves stay smooth at any zoom); each sample is offset by ±half-width along the curve
 /// normal to form the ribbon. Width follows the brush's `width_profile`.
 ///
-/// The fill is **solid**: vector line art is conventionally opaque, and — more importantly —
-/// the round caps/joins are simple overlapping discs whose overlap is only invisible when the
-/// fill is opaque (a translucent fill would darken at every joint). So the brush opacity slider
-/// is intentionally not applied here; only the colour's own alpha (normally 1.0) is used, and
-/// the silhouette is still antialiased by the edge falloff in the shader. The `edge` channel is
-/// -1/0/+1 across the ribbon width and 0→1 radially within a disc, so one shader antialiases
-/// both.
+/// The fill is **solid and opaque**: vector line art is conventionally opaque, and — more
+/// importantly — the ribbon is a *union* of overlapping primitives (the body quads, the round
+/// caps, and a round-join disc at every sharp corner). Overlap is only invisible when each
+/// primitive is fully opaque; a translucent fill (or a translucent antialiased rim) would darken
+/// at every joint and shed thin slivers wherever two primitives' edges cross. So the brush
+/// opacity slider is intentionally not applied here (only the colour's own alpha, normally 1.0),
+/// and the silhouette is **not** feathered in the fragment shader. Instead the whole layer is
+/// drawn into a multisampled target and resolved (see `VectorPathPipeline::encode`), which
+/// antialiases the *true outer silhouette* of the union without ever making an interior edge
+/// translucent. The `edge` channel (−1/0/+1 across the width, 0→1 radially in a disc) is retained
+/// only for the secondary blend path, which still draws single-sampled.
 pub fn tessellate_stroke(stroke: &GaussianBezierStroke, zoom: f32, out: &mut Vec<VectorVertex>) {
     let sk = &stroke.skeleton;
     if sk.segments.is_empty() {
@@ -258,7 +262,7 @@ fn push_quad(out: &mut Vec<VectorVertex>, al: Vec2, ar: Vec2, br: Vec2, bl: Vec2
 }
 
 /// Push a filled disc as a triangle fan (`segments` wedges). The center carries edge 0 and the
-/// rim edge 1, so the shared shader antialiases the rim exactly like the ribbon's long edges.
+/// rim edge 1.
 fn push_disc(out: &mut Vec<VectorVertex>, center: Vec2, radius: f32, color: u32, segments: usize) {
     let c = VectorVertex { pos: [center.x, center.y], edge: 0.0, color };
     for k in 0..segments {

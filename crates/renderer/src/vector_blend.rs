@@ -55,10 +55,13 @@ pub struct VectorBlendVertex {
 /// Accumulation-mask format: signed (the smear direction lands in rg) and additively blendable.
 const MASK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
-/// Lazily-sized offscreen targets: the plain vector-stroke `layer` (sampled by the resolve pass)
-/// and the additive smear `mask` (direction + weight). Both track the render-target size.
+/// Lazily-sized offscreen targets. `color` is a ping-pong pair holding the running colour
+/// composite: the plain vector strokes land in `color[0]`, then each blend stroke (in document
+/// z-order) reads one and writes the other, so a higher-z stroke smears the result the lower-z
+/// strokes already produced. `mask` is the additive smear accumulator (direction + weight) for the
+/// stroke currently being resolved. All track the render-target size.
 struct Targets {
-    layer: wgpu::TextureView,
+    color: [wgpu::TextureView; 2],
     mask: wgpu::TextureView,
     width: u32,
     height: u32,
@@ -291,9 +294,12 @@ impl VectorBlendPipeline {
                 module: &resolve_shader,
                 entry_point: Some("fs_resolve"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
+                // No hardware blend: the resolve writes every pixel (the smear composited over the
+                // layers beneath, or those layers passed straight through), so the destination is a
+                // complete copy. The `over` happens in the shader against the sampled `beneath`.
                 targets: &[Some(wgpu::ColorTargetState {
                     format: target_format,
-                    blend: Some(over),
+                    blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -369,7 +375,10 @@ impl VectorBlendPipeline {
                     .create_view(&wgpu::TextureViewDescriptor::default())
             };
             self.targets = Some(Targets {
-                layer: make("vector blend layer", self.format),
+                color: [
+                    make("vector blend color 0", self.format),
+                    make("vector blend color 1", self.format),
+                ],
                 mask: make("vector blend mask", MASK_FORMAT),
                 width,
                 height,
@@ -383,9 +392,10 @@ impl VectorBlendPipeline {
             .expect("VectorBlendPipeline::ensure must precede target access")
     }
 
-    /// The offscreen vector-layer view (render target for the plain vectors; sampled by resolve).
-    pub fn layer_view(&self) -> &wgpu::TextureView {
-        &self.targets().layer
+    /// One of the two ping-pong colour views (`i` in `0..=1`). `color_view(0)` is the plain-vector
+    /// layer the first blend stroke smears; the resolve loop alternates source/destination.
+    pub fn color_view(&self, i: usize) -> &wgpu::TextureView {
+        &self.targets().color[i]
     }
 
     /// The offscreen smear-mask view (additive accumulate target; read by resolve).
@@ -435,8 +445,15 @@ impl VectorBlendPipeline {
         })
     }
 
-    /// Bind group for the resolve pass: camera (0) + layer texture (1) + sampler (2) + mask (3).
-    pub fn resolve_bind_group(&self, device: &wgpu::Device, camera: &wgpu::Buffer) -> wgpu::BindGroup {
+    /// Bind group for the resolve pass: camera (0), the `beneath` colour texture being smeared (1),
+    /// sampler (2), mask (3). `beneath` is whichever ping-pong colour view currently holds the
+    /// composite below the stroke being resolved; it must not be the resolve's render target.
+    pub fn resolve_bind_group(
+        &self,
+        device: &wgpu::Device,
+        camera: &wgpu::Buffer,
+        beneath: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
         let targets = self.targets();
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("vector blend resolve bind group"),
@@ -448,7 +465,7 @@ impl VectorBlendPipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&targets.layer),
+                    resource: wgpu::BindingResource::TextureView(beneath),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -529,12 +546,33 @@ fn sampler_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// Tessellate every `vector_blend` stroke in `doc` into `out` (cleared first).
-pub fn tessellate_blend_document(doc: &Document, zoom: f32, out: &mut Vec<VectorBlendVertex>) {
+/// Tessellate every `vector_blend` stroke in `doc` into `out` (cleared first), walking strokes in
+/// document z-order — layers back-to-front, strokes within a layer in order — and recording the
+/// per-stroke vertex range in `ranges` (also cleared first). The renderer resolves each range
+/// separately in this order so a higher-z blend stroke smears over the result of the lower-z ones.
+/// A stroke that tessellates to nothing contributes no range.
+pub fn tessellate_blend_document(
+    doc: &Document,
+    zoom: f32,
+    out: &mut Vec<VectorBlendVertex>,
+    ranges: &mut Vec<std::ops::Range<u32>>,
+) {
     out.clear();
-    for stroke in doc.strokes.values() {
-        if stroke.vector_blend {
+    ranges.clear();
+    for layer in &doc.layers {
+        for &sid in &layer.stroke_ids {
+            let Some(stroke) = doc.strokes.get(sid) else {
+                continue;
+            };
+            if !stroke.vector_blend {
+                continue;
+            }
+            let start = out.len() as u32;
             tessellate_blend_stroke(stroke, zoom, out);
+            let end = out.len() as u32;
+            if end > start {
+                ranges.push(start..end);
+            }
         }
     }
 }
@@ -658,6 +696,41 @@ mod tests {
         CubicBezier::new(a, a + (b - a) / 3.0, a + (b - a) * (2.0 / 3.0), b)
     }
 
+    fn add_blend(doc: &mut Document, layer: app_core::ids::LayerId, a: Vec2, b: Vec2) {
+        let brush = BrushModel { radius: 8.0, ..BrushModel::default() };
+        let sid = doc.add_stroke(layer, BezierSkeleton::single(straight(a, b)), brush);
+        let s = doc.stroke_mut(sid).unwrap();
+        s.render_as_vector = true;
+        s.vector_blend = true;
+    }
+
+    /// The per-stroke ranges are emitted in document z-order: layers back-to-front, strokes in
+    /// order within a layer. The ranges partition `out` contiguously with no overlap or gap.
+    #[test]
+    fn blend_ranges_follow_document_z_order() {
+        let mut doc = Document::new();
+        let back = doc.add_layer("back");
+        let front = doc.add_layer("front");
+        // Two strokes in the back layer, one in the front layer.
+        add_blend(&mut doc, back, Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0));
+        add_blend(&mut doc, back, Vec2::new(0.0, 20.0), Vec2::new(100.0, 20.0));
+        add_blend(&mut doc, front, Vec2::new(0.0, 40.0), Vec2::new(100.0, 40.0));
+
+        let mut out = Vec::new();
+        let mut ranges = Vec::new();
+        tessellate_blend_document(&doc, 1.0, &mut out, &mut ranges);
+
+        assert_eq!(ranges.len(), 3, "three blend strokes => three resolve ranges");
+        // Contiguous, non-overlapping partition starting at 0 and ending at out.len().
+        assert_eq!(ranges[0].start, 0);
+        assert_eq!(ranges[0].end, ranges[1].start);
+        assert_eq!(ranges[1].end, ranges[2].start);
+        assert_eq!(ranges[2].end, out.len() as u32);
+        for r in &ranges {
+            assert!(r.end > r.start, "every range is non-empty");
+        }
+    }
+
     /// A document with one plain vector stroke and one blend stroke; the tessellator must pick
     /// only the blend stroke, and only when `vector_blend` is set.
     #[test]
@@ -685,13 +758,17 @@ mod tests {
         }
 
         let mut out = Vec::new();
-        tessellate_blend_document(&doc, 1.0, &mut out);
+        let mut ranges = Vec::new();
+        tessellate_blend_document(&doc, 1.0, &mut out, &mut ranges);
         assert!(!out.is_empty(), "the blend stroke should produce ribbon vertices");
+        assert_eq!(ranges.len(), 1, "one blend stroke => one resolve range");
+        assert_eq!(ranges[0], 0..out.len() as u32, "the range must span the stroke's vertices");
 
         // Drop the blend flag: now nothing is tessellated.
         doc.stroke_mut(blend).unwrap().vector_blend = false;
-        tessellate_blend_document(&doc, 1.0, &mut out);
+        tessellate_blend_document(&doc, 1.0, &mut out, &mut ranges);
         assert!(out.is_empty(), "no blend strokes => no vertices");
+        assert!(ranges.is_empty(), "no blend strokes => no ranges");
     }
 
     /// Every emitted vertex carries a finite, non-degenerate smear vector aligned with the path,
@@ -715,7 +792,8 @@ mod tests {
         }
 
         let mut out = Vec::new();
-        tessellate_blend_document(&doc, 1.0, &mut out);
+        let mut ranges = Vec::new();
+        tessellate_blend_document(&doc, 1.0, &mut out, &mut ranges);
         assert!(!out.is_empty());
 
         let expected_len = 8.0 * SMEAR_FACTOR; // half-width * factor

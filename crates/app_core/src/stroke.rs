@@ -102,6 +102,17 @@ pub struct GaussianBezierStroke {
     /// meaningful when `vector_blend` is set.
     #[serde(default = "default_blend_strength")]
     pub blend_strength: f32,
+    /// When true the stroke is a *gaussian blend*: a normal Gaussian splat cloud (so it renders
+    /// through the ordinary splat path, `render_as_vector = false`), but its splats carry no
+    /// colour of their own. Each frame their colours are re-derived from the splats of the strokes
+    /// *beneath* this one in document z-order — a gaussian-weighted average of whatever lies under
+    /// each splat (see `crate::gaussian_blend`). The geometry stays fully parametric/editable (the
+    /// skeleton + the curve-local splats); only the colours are a live, recomputed view of the art
+    /// below. `blend_strength` scales the result's opacity. Distinct from `vector_blend` (a
+    /// render-time directional smear of the vector layer) and from the `crate::blend` smudge tool
+    /// (which destructively rewrites colours). Set by the gaussian-blend tool.
+    #[serde(default)]
+    pub gaussian_blend: bool,
     #[serde(skip)]
     pub dirty_flags: StrokeDirtyFlags,
     /// Monotonic allocator for splat ids within this stroke.
@@ -122,6 +133,7 @@ impl GaussianBezierStroke {
             render_as_vector: false,
             vector_blend: false,
             blend_strength: default_blend_strength(),
+            gaussian_blend: false,
             dirty_flags: StrokeDirtyFlags::default(),
             next_splat_id: 0,
         };

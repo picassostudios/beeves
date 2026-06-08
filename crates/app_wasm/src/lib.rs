@@ -42,6 +42,13 @@ enum Tool {
     /// `renderer::vector_blend`). A live, non-destructive smudge described by a vector, distinct
     /// from the gaussian [`Tool::Blend`] which destructively rewrites splat colours.
     VectorBlend,
+    /// Gaussian-blend tool: captured exactly like [`Tool::VectorDraw`] (the same freehand,
+    /// curvature-adaptive fit for a minimal-anchor skeleton), but the committed stroke is a
+    /// *gaussian blend* — an ordinary splat cloud whose colours are re-derived every frame from
+    /// the splats beneath it in z-order (see `app_core::gaussian_blend`). It renders through the
+    /// normal splat path and blends with the art below using the ordinary splat math, unlike the
+    /// render-time directional smear of [`Tool::VectorBlend`].
+    GaussianBlend,
     Bezier,
     /// Direct-edit (node) tool: select a stroke, then drag its anchors and tangent
     /// handles — Illustrator's Direct-Selection / vector tool.
@@ -59,6 +66,7 @@ impl Tool {
         match s {
             "vectordraw" => Tool::VectorDraw,
             "vectorblend" => Tool::VectorBlend,
+            "gaussianblend" => Tool::GaussianBlend,
             "bezier" => Tool::Bezier,
             "edit" => Tool::Edit,
             "sculpt" => Tool::Sculpt,
@@ -80,6 +88,9 @@ enum PreviewKind {
     Vector,
     /// Vector-blend smear path (vector-blend): `render_as_vector = true`, `vector_blend = true`.
     Blend,
+    /// Gaussian-blend cloud (gaussian-blend): a normal splat cloud (`render_as_vector = false`)
+    /// flagged `gaussian_blend = true`, so its colours are resampled from beneath each frame.
+    GaussianBlend,
 }
 
 /// Which kernel the renderer draws splats with. This is *orthogonal* to the active tool and to
@@ -422,6 +433,13 @@ impl WasmApp {
         // giving four combinations — convex inherits the crisp path (and thus blending) for free.
         let camera = self.camera.uniform();
         let (w, h) = (self.config.width, self.config.height);
+
+        // Gaussian-blend strokes carry no colour of their own: re-derive every blend splat's
+        // colour from the art beneath it before drawing. No-op (and near-free) when the document
+        // has no blend strokes; otherwise it flags those strokes for GPU re-upload so the splat
+        // pass below picks up the fresh colours.
+        app_core::gaussian_blend::resample_document_blends(&mut self.doc);
+
         match (self.render_mode, self.crisp_edges) {
             (RenderMode::Gaussian, false) => self.splat_renderer.render_doc(
                 &self.gpu.device, &self.gpu.queue, &view, &mut self.doc, &camera, view_min,
@@ -459,6 +477,18 @@ impl WasmApp {
             &camera,
         );
 
+        // Gaussian-blend strokes are splat clouds that sample the art beneath them, so they must
+        // composite *above* both the splat field and the vector layer. They were excluded from the
+        // passes above and are drawn here, last, as a Gaussian splat overlay.
+        self.splat_renderer.render_blend_splats(
+            &self.gpu.device,
+            &self.gpu.queue,
+            &view,
+            &self.doc,
+            view_min,
+            view_max,
+        );
+
         frame.present();
     }
 
@@ -478,7 +508,7 @@ impl WasmApp {
             Tool::Brush => {
                 self.pointer.polyline.push(world);
             }
-            Tool::VectorDraw | Tool::VectorBlend => {
+            Tool::VectorDraw | Tool::VectorBlend | Tool::GaussianBlend => {
                 // Same freehand capture as the brush; the fitter differs (see pointer_move).
                 // Clear the previous stroke's window highlight so a new gesture starts clean.
                 self.vector_viz = None;
@@ -568,7 +598,7 @@ impl WasmApp {
                 // stroke so it tracks the cursor as the user draws.
                 self.brush_rebuild_preview();
             }
-            Tool::VectorDraw | Tool::VectorBlend => {
+            Tool::VectorDraw | Tool::VectorBlend | Tool::GaussianBlend => {
                 self.pointer.polyline.push(world);
                 // Feed the incremental fitter one point; it commits settled windows and re-fits
                 // only the open tail, so this stays cheap no matter how long the stroke gets.
@@ -643,7 +673,7 @@ impl WasmApp {
             }
         }
 
-        if matches!(self.tool, Tool::VectorDraw | Tool::VectorBlend) {
+        if matches!(self.tool, Tool::VectorDraw | Tool::VectorBlend | Tool::GaussianBlend) {
             if self.pointer.polyline.last() != Some(&world) {
                 self.pointer.polyline.push(world);
                 if let Some(fit) = self.vector_fit.as_mut() {
@@ -1001,7 +1031,7 @@ impl WasmApp {
         if self.tool == Tool::Edit {
             if let Some(sid) = self.edit.target {
                 if let Some(stroke) = self.doc.stroke_mut(sid) {
-                    if stroke.vector_blend {
+                    if stroke.vector_blend || stroke.gaussian_blend {
                         stroke.blend_strength = self.vector_blend_strength;
                     }
                 }
@@ -1160,11 +1190,12 @@ impl WasmApp {
             Some(fit) => fit.skeleton(),
             None => self.fit_vector_skeleton(&self.pointer.polyline),
         };
-        // The vector-blend tool commits a smear path; the vector-draw tool a plain vector path.
-        let kind = if self.tool == Tool::VectorBlend {
-            PreviewKind::Blend
-        } else {
-            PreviewKind::Vector
+        // Each tool commits a different stroke kind: vector-blend a smear path, gaussian-blend a
+        // resampled splat cloud, vector-draw a plain vector path.
+        let kind = match self.tool {
+            Tool::VectorBlend => PreviewKind::Blend,
+            Tool::GaussianBlend => PreviewKind::GaussianBlend,
+            _ => PreviewKind::Vector,
         };
         self.set_preview_stroke(skeleton, kind);
         self.vector_viz = self.pointer.preview;
@@ -1370,6 +1401,14 @@ fn triangle_sigma(softness: f32) -> f32 {
     0.06 + 2.4 * softness.clamp(0.0, 1.0).powf(1.4)
 }
 
+/// Shrink factor applied to the brush radius for a gaussian-blend cloud so its splats are smaller
+/// than a normal stroke's and read as a soft field rather than discrete blobs. The brush-radius
+/// slider still controls the overall size; this just scales it down.
+const GAUSSIAN_BLEND_RADIUS_SCALE: f32 = 0.5;
+/// Denser station spacing for a gaussian-blend cloud (relative to the brush spacing) so the
+/// smaller splats still overlap heavily along the path and never show gaps between stations.
+const GAUSSIAN_BLEND_SPACING_SCALE: f32 = 0.5;
+
 /// Apply a [`PreviewKind`] to `stroke`, setting the render flags the renderer consumes. A splat
 /// stroke regenerates its cloud; vector and blend strokes drop their splats (they render as
 /// tessellated paths) and a blend stroke additionally records its smear `strength`.
@@ -1378,18 +1417,40 @@ fn apply_preview_kind(stroke: &mut GaussianBezierStroke, kind: PreviewKind, stre
         PreviewKind::Splat => {
             stroke.render_as_vector = false;
             stroke.vector_blend = false;
+            stroke.gaussian_blend = false;
             stroke.regenerate_splats();
         }
         PreviewKind::Vector => {
             stroke.render_as_vector = true;
             stroke.vector_blend = false;
+            stroke.gaussian_blend = false;
             stroke.splats.clear();
         }
         PreviewKind::Blend => {
             stroke.render_as_vector = true;
             stroke.vector_blend = true;
+            stroke.gaussian_blend = false;
             stroke.blend_strength = strength;
             stroke.splats.clear();
+        }
+        PreviewKind::GaussianBlend => {
+            // A normal splat cloud: render through the splat path. The cloud's colours are a live
+            // view of the art beneath it (see `app_core::gaussian_blend`), refreshed each frame;
+            // `regenerate_splats` lays down the geometry now (colours are overwritten on resample).
+            stroke.render_as_vector = false;
+            stroke.vector_blend = false;
+            stroke.gaussian_blend = true;
+            stroke.blend_strength = strength;
+            // Tune the brush so the cloud reads as one merged, soft field instead of a row of
+            // visible ellipses: fully soft interior *and* silhouette (no crisp edge ring), no
+            // texture jitter, and a smaller footprint so neighbouring splats overlap heavily and
+            // disappear into each other and into the art beneath.
+            stroke.brush.hardness = 0.0;
+            stroke.brush.edge_hardness = 0.0;
+            stroke.brush.texture_strength = 0.0;
+            stroke.brush.radius *= GAUSSIAN_BLEND_RADIUS_SCALE;
+            stroke.brush.spacing = (stroke.brush.spacing * GAUSSIAN_BLEND_SPACING_SCALE).max(1.0);
+            stroke.regenerate_splats();
         }
     }
 }

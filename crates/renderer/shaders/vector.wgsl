@@ -42,11 +42,22 @@ fn vs_main(in: VsIn) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Distance (in `edge` units) from the nearest long rim, converted to pixels via the
     // screen-space derivative of `edge`, for a resolution-independent ~1px antialiased edge.
+    // Used by the single-sampled blend path (no MSAA there).
     let dist = 1.0 - abs(in.edge);
     let aa = max(fwidth(in.edge), 1e-5);
     let coverage = clamp(dist / aa + 0.5, 0.0, 1.0);
 
     let a = clamp(in.color.w * coverage, 0.0, 1.0);
+    // Premultiplied alpha.
+    return vec4<f32>(in.color.xyz * a, a);
+}
+
+// Solid, un-feathered fill for the multisampled path. Every fragment is fully opaque so the
+// ribbon's overlapping primitives (body + caps + joins) compose without slivers; MSAA resolve
+// antialiases the union's true outer silhouette. `edge` is ignored here.
+@fragment
+fn fs_solid(in: VsOut) -> @location(0) vec4<f32> {
+    let a = clamp(in.color.w, 0.0, 1.0);
     // Premultiplied alpha.
     return vec4<f32>(in.color.xyz * a, a);
 }

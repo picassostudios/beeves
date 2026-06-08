@@ -18,6 +18,7 @@ pub mod brush;
 pub mod commands;
 pub mod document;
 pub mod fitting;
+pub mod gaussian_blend;
 pub mod ids;
 pub mod math;
 pub mod selection;

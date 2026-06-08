@@ -1,16 +1,24 @@
-// Vector-blend (directional smear) — resolve pass.
+// Vector-blend (directional smear) — resolve pass, run once per blend stroke in document z-order.
 //
-// A full-screen triangle reads the accumulated mask (from `vector_blend.wgsl`) and the offscreen
-// vector-stroke layer, and for every covered pixel produces the directional smear *once*:
+// A full-screen triangle reads the accumulated mask (one blend stroke's ribbon, from
+// `vector_blend.wgsl`) and the running colour composite of everything *beneath* this stroke
+// (`beneath`), and for every covered pixel produces the directional smear:
 //
 //   * recover the coverage-weighted average smear direction  dir = mask.rg / mask.b
 //   * recover the soft coverage                              coverage = clamp(mask.b)
-//   * average the layer along ±dir with ~1px tap spacing (adaptive, so a long smear does not
-//     ghost into a few discrete copies of the underlying edges)
-//   * composite the average over the view at `coverage` opacity (premultiplied `over`)
+//   * take a Gaussian-weighted average of `beneath` along ±dir (nearby colour dominates, distant
+//     colour falls off smoothly — softer and less muddy than a flat box average)
+//   * composite that smear over `beneath` (premultiplied `over`) at `coverage` opacity
 //
-// Resolving once — instead of compositing every overlapping ribbon triangle — is what keeps the
-// mark clean (no cap rings, no cross-hatch where strokes overlap) while staying soft at the rim.
+// Crucially the smear samples and composites over `beneath` — the layers below *this* stroke in
+// document order — and the renderer ping-pongs the colour target so each successive (higher-z)
+// blend stroke smears the result the lower-z strokes already produced. That is what makes the
+// z-order matter: a back stroke smears first, a front stroke smears over it.
+//
+// Untouched pixels pass `beneath` straight through (the shader writes every pixel, with no
+// hardware blend, so the output target is a complete copy of the layers below plus this smear).
+// Resolving once per stroke — instead of compositing every overlapping ribbon triangle — keeps the
+// mark clean (no cap rings, no cross-hatch) while staying soft at the rim.
 
 struct Camera {
     scale: vec2<f32>,
@@ -20,7 +28,8 @@ struct Camera {
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
-@group(0) @binding(1) var layer: texture_2d<f32>;
+// The running colour composite of every layer beneath this blend stroke (premultiplied alpha).
+@group(0) @binding(1) var beneath: texture_2d<f32>;
 @group(0) @binding(2) var samp: sampler;
 @group(0) @binding(3) var mask: texture_2d<f32>;
 
@@ -43,15 +52,22 @@ fn vs_resolve(@builtin(vertex_index) vi: u32) -> VsOut {
 // long smears; the step count is otherwise ~1 per pixel of smear length.
 const MAX_STEPS: i32 = 48;
 
+// Gaussian sample weighting across the smear: weight = exp(-(t*t)/(2*SIGMA*SIGMA)) with t in
+// [-1,1] over the smear half-length. Smaller SIGMA = tighter core (nearby colour dominates);
+// SIGMA = 0.5 leaves the rim taps at exp(-2) ≈ 0.14, so the ends still contribute but softly.
+const SIGMA: f32 = 0.5;
+
 @fragment
 fn fs_resolve(in: VsOut) -> @location(0) vec4<f32> {
     let res = max(camera.params.zw, vec2<f32>(1.0, 1.0));
     let pix = vec2<i32>(in.position.xy);
+    // The layers beneath this stroke at this pixel; the smear composites over this, and untouched
+    // pixels return it unchanged.
+    let base = textureLoad(beneath, pix, 0);
     let m = textureLoad(mask, pix, 0);
     let w = m.b;
     if (w <= 1e-4) {
-        // Untouched by any blend stroke: leave the view as-is.
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        return base;
     }
     let dir = m.rg / w;                  // coverage-weighted average smear half-vector (uv)
     let coverage = clamp(w, 0.0, 1.0);
@@ -60,16 +76,22 @@ fn fs_resolve(in: VsOut) -> @location(0) vec4<f32> {
     let half_len_px = length(dir * res);
     let steps = clamp(i32(ceil(half_len_px)), 1, MAX_STEPS);
 
-    // The layer is premultiplied alpha, so a straight average is the correct premultiplied blend.
+    // `beneath` is premultiplied alpha, so the Gaussian-weighted sum is the correct premultiplied
+    // blend. Weighting by a Gaussian keeps the colour under the pixel dominant and lets the smear
+    // fade rather than flatten into a uniform box average.
+    let inv_two_sigma2 = 1.0 / (2.0 * SIGMA * SIGMA);
     var sum = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    var count = 0.0;
+    var wsum = 0.0;
     for (var k: i32 = -steps; k <= steps; k = k + 1) {
-        let f = f32(k) / f32(steps);
-        sum = sum + textureSampleLevel(layer, samp, uv + dir * f, 0.0);
-        count = count + 1.0;
+        let t = f32(k) / f32(steps);
+        let g = exp(-t * t * inv_two_sigma2);
+        sum = sum + g * textureSampleLevel(beneath, samp, uv + dir * t, 0.0);
+        wsum = wsum + g;
     }
-    let avg = sum / count;
+    let avg = sum / max(wsum, 1e-6);
 
-    // `avg` is premultiplied; scaling by coverage keeps it premultiplied.
-    return avg * coverage;
+    // Composite this stroke's smear over the layers beneath it (premultiplied `over`) at the soft
+    // coverage. `smear` is premultiplied, so scaling by coverage keeps it premultiplied.
+    let smear = avg * coverage;
+    return smear + base * (1.0 - smear.a);
 }

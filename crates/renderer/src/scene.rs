@@ -65,10 +65,13 @@ impl SceneLayout {
         for stroke in doc.strokes.values_mut() {
             let id = stroke.id;
             // Vector-rendered strokes are drawn as tessellated paths (see
-            // `SplatRenderer::render_vector_paths`), not splats. Skip them here so they never
-            // enter the resident splat mirror. Not marking the slot `seen` lets the removal
-            // sweep reclaim a slot if a stroke is ever toggled to vector after the fact.
-            if stroke.render_as_vector {
+            // `SplatRenderer::render_vector_paths`), not splats. Gaussian-blend strokes are splat
+            // clouds, but they must composite *on top* of the vector layer (they sample the art
+            // beneath them), so they are drawn in a dedicated overlay pass after the vectors (see
+            // `SplatRenderer::render_blend_splats`) rather than in this resident pass. Skip both
+            // here so they never enter the resident splat mirror. Not marking the slot `seen` lets
+            // the removal sweep reclaim a slot if a stroke is ever toggled back after the fact.
+            if stroke.render_as_vector || stroke.gaussian_blend {
                 continue;
             }
             let is_new = !self.slots.contains_key(&id);

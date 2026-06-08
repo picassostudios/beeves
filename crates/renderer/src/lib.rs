@@ -94,6 +94,14 @@ pub struct SplatRenderer {
     vector_blend: VectorBlendPipeline,
     /// Reused per-frame smear tessellation scratch so the blend pass never allocates.
     blend_scratch: Vec<VectorBlendVertex>,
+    /// Per-blend-stroke vertex ranges into `blend_scratch`, in document z-order. The blend pass
+    /// resolves each range separately and in order so the z-order of overlapping smears matters.
+    blend_ranges: Vec<std::ops::Range<u32>>,
+    /// Instance buffer for the gaussian-blend overlay pass: the splats of `gaussian_blend` strokes,
+    /// drawn on top of the splat + vector layers so they composite over the art they sample.
+    blend_overlay: SplatBuffer,
+    /// Reused per-frame packing scratch for the gaussian-blend overlay so it never allocates.
+    blend_overlay_scratch: Vec<GpuSplat>,
 }
 
 impl SplatRenderer {
@@ -130,6 +138,9 @@ impl SplatRenderer {
             vector_scratch: Vec::new(),
             vector_blend,
             blend_scratch: Vec::new(),
+            blend_ranges: Vec::new(),
+            blend_overlay: SplatBuffer::new(device, &[]),
+            blend_overlay_scratch: Vec::new(),
         }
     }
 
@@ -301,7 +312,12 @@ impl SplatRenderer {
     ) {
         let zoom = camera.params[0];
         vector::tessellate_document(doc, zoom, &mut self.vector_scratch);
-        vector_blend::tessellate_blend_document(doc, zoom, &mut self.blend_scratch);
+        vector_blend::tessellate_blend_document(
+            doc,
+            zoom,
+            &mut self.blend_scratch,
+            &mut self.blend_ranges,
+        );
         let has_vectors = !self.vector_scratch.is_empty();
         let has_blend = !self.blend_scratch.is_empty();
         if !has_vectors && !has_blend {
@@ -324,6 +340,39 @@ impl SplatRenderer {
         self.vector.upload(device, queue, &self.vector_scratch);
         self.vector_blend.upload(device, queue, &self.blend_scratch);
         self.encode_blend(device, queue, view, has_vectors);
+    }
+
+    /// Draw the document's `gaussian_blend` strokes as a Gaussian splat overlay composited on top
+    /// of whatever is already in `view` (it **loads**, never clears). These strokes are excluded
+    /// from the resident splat pass and from `render_vector_paths`, so this must be called **last**
+    /// — after the splat field and the vector layer — so the blend clouds sit above the art whose
+    /// colours they sampled. Uses the plain Gaussian splat pipeline (the same blending math as an
+    /// ordinary splat curve); a document with no blend strokes is a no-op (no pass encoded).
+    ///
+    /// `camera` must already be uploaded (the caller's splat pass does this each frame).
+    pub fn render_blend_splats(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        doc: &Document,
+        view_min: glam::Vec2,
+        view_max: glam::Vec2,
+    ) {
+        collect_blend_splats_in_view(doc, view_min, view_max, &mut self.blend_overlay_scratch);
+        if self.blend_overlay_scratch.is_empty() {
+            return;
+        }
+        self.blend_overlay.update(device, queue, &self.blend_overlay_scratch);
+        let bind_group = self.splat_bind_group(device, &self.blend_overlay.buffer);
+        encode_overlay_splat_pass(
+            device,
+            queue,
+            view,
+            &self.pipeline.pipeline,
+            &bind_group,
+            self.blend_overlay.len as u32,
+        );
     }
 
     /// Single-pass plain-vector draw: composite the tessellated ribbons onto `view` (load).
@@ -362,10 +411,18 @@ impl SplatRenderer {
         queue.submit(Some(encoder.finish()));
     }
 
-    /// Four-pass smear draw: (1) render the plain vectors into the offscreen layer, (2) blit the
-    /// layer onto `view`, (3) accumulate the blend ribbons into the offscreen mask (additive
-    /// direction + weight), (4) resolve the mask against the layer once and composite the smear
-    /// onto `view`. Buffers must already be uploaded and the targets sized via
+    /// Z-ordered smear draw. The plain vectors are rendered once into ping-pong colour buffer 0;
+    /// then each blend stroke, **in document z-order**, is resolved separately: accumulate just
+    /// that stroke's ribbon into the mask, then resolve it against whichever colour buffer holds
+    /// the composite beneath it (Gaussian-weighted smear, composited `over` in the shader) writing
+    /// into the other buffer. Ping-ponging the two buffers means a higher-z stroke smears the
+    /// result the lower-z strokes already produced, so the blend order matters. A final blit
+    /// composites the last colour buffer over `view`.
+    ///
+    /// Pass count is `2 + 2 * blend_ranges.len()` (vectors + final blit, plus accumulate/resolve
+    /// per stroke). All plain vectors form one flattened colour field that every blend stroke may
+    /// smear; only the ordering *among blend strokes* is z-resolved (vectors are not interleaved
+    /// per-stroke). Buffers must already be uploaded and the targets sized via
     /// [`vector_blend::VectorBlendPipeline::ensure`].
     fn encode_blend(
         &self,
@@ -374,24 +431,28 @@ impl SplatRenderer {
         view: &wgpu::TextureView,
         has_vectors: bool,
     ) {
-        let layer = self.vector_blend.layer_view();
+        let color0 = self.vector_blend.color_view(0);
+        let color1 = self.vector_blend.color_view(1);
         let mask = self.vector_blend.mask_view();
         let vec_bind_group = self.vector_camera_bind_group(device);
-        let blit_bind_group = self.vector_blend.blit_bind_group(device, layer);
         let accum_bind_group = self.vector_blend.accum_bind_group(device, &self.camera_buffer);
-        let resolve_bind_group = self.vector_blend.resolve_bind_group(device, &self.camera_buffer);
+        // One resolve bind group per ping-pong source (binds the buffer being read as `beneath`).
+        let resolve_from = [
+            self.vector_blend.resolve_bind_group(device, &self.camera_buffer, color0),
+            self.vector_blend.resolve_bind_group(device, &self.camera_buffer, color1),
+        ];
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("vector blend encoder"),
         });
 
-        // Pass 1: plain vectors -> offscreen layer (cleared transparent so untouched texels read
-        // as empty for the smear taps).
+        // Pass 1: plain vectors -> colour buffer 0 (cleared transparent so untouched texels read as
+        // empty for the smear taps). This is the colour field the first blend stroke smears.
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("vector layer pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: layer,
+                    view: color0,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -412,10 +473,70 @@ impl SplatRenderer {
             }
         }
 
-        // Pass 2: blit the layer onto the view so the plain vectors still appear.
+        // Per-stroke smear, in document z-order, ping-ponging colour buffers: `src` holds the
+        // composite beneath the current stroke; we resolve into `1 - src` and swap.
+        let mut src = 0usize;
+        for range in &self.blend_ranges {
+            let dst = 1 - src;
+
+            // Accumulate only this stroke's ribbon into the mask (additive, cleared transparent).
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("vector blend accum pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: mask,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rpass.set_pipeline(self.vector_blend.accum_pipeline());
+                rpass.set_bind_group(0, &accum_bind_group, &[]);
+                rpass.set_vertex_buffer(0, self.vector_blend.buffer().slice(..));
+                rpass.draw(range.clone(), 0..1);
+            }
+
+            // Resolve: smear `color[src]` along the mask direction and composite over it, writing
+            // the full image into `color[dst]`. No hardware blend (the resolve writes every pixel).
+            {
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("vector blend resolve pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: self.vector_blend.color_view(dst),
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rpass.set_pipeline(self.vector_blend.resolve_pipeline());
+                rpass.set_bind_group(0, &resolve_from[src], &[]);
+                rpass.draw(0..3, 0..1);
+            }
+
+            src = dst;
+        }
+
+        // Final: composite the last colour buffer (vectors + all smears) over the view (`over`).
+        let final_bind_group = self
+            .vector_blend
+            .blit_bind_group(device, self.vector_blend.color_view(src));
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("vector blit pass"),
+                label: Some("vector blend composite pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     depth_slice: None,
@@ -431,54 +552,7 @@ impl SplatRenderer {
                 multiview_mask: None,
             });
             rpass.set_pipeline(self.vector_blend.blit_pipeline());
-            rpass.set_bind_group(0, &blit_bind_group, &[]);
-            rpass.draw(0..3, 0..1);
-        }
-
-        // Pass 3: accumulate the blend ribbons into the mask (additive, cleared transparent).
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("vector blend accum pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: mask,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rpass.set_pipeline(self.vector_blend.accum_pipeline());
-            rpass.set_bind_group(0, &accum_bind_group, &[]);
-            rpass.set_vertex_buffer(0, self.vector_blend.buffer().slice(..));
-            rpass.draw(0..self.vector_blend.vertex_count(), 0..1);
-        }
-
-        // Pass 4: resolve the mask against the layer once and composite the smear onto the view.
-        {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("vector blend resolve pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rpass.set_pipeline(self.vector_blend.resolve_pipeline());
-            rpass.set_bind_group(0, &resolve_bind_group, &[]);
+            rpass.set_bind_group(0, &final_bind_group, &[]);
             rpass.draw(0..3, 0..1);
         }
 
@@ -951,6 +1025,45 @@ fn encode_resident_pass(
     queue.submit(Some(encoder.finish()));
 }
 
+/// Composite `count` splat instances onto `view` on top of its current contents (`load`, never
+/// clears), with premultiplied-`over` blending. Used by the gaussian-blend overlay so its clouds
+/// sit above the splat + vector layers. Drawing all instances in one range is fine — the overlay
+/// is repacked from the visible blend splats each frame.
+fn encode_overlay_splat_pass(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    view: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    bind_group: &wgpu::BindGroup,
+    count: u32,
+) {
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("blend splat overlay encoder"),
+    });
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("blend splat overlay pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rpass.set_pipeline(pipeline);
+        rpass.set_bind_group(0, bind_group, &[]);
+        rpass.draw(0..6, 0..count);
+    }
+    queue.submit(Some(encoder.finish()));
+}
+
 /// Encode and submit the two crisp-path passes: accumulate the splat instances in `ranges`
 /// into the coverage pipeline's offscreen targets (using the caller-supplied `accum_pipeline`
 /// and `accum_bind_group`), then resolve them into `view` (cleared to `clear` first). The
@@ -1077,6 +1190,34 @@ pub fn collect_gpu_splats_in_view(
         }
     }
     out
+}
+
+/// Pack the visible splats of every `gaussian_blend` stroke into `out` (cleared first) for the
+/// overlay pass. Mirrors [`collect_gpu_splats_in_view`]'s per-splat AABB cull and stable stroke
+/// index, but keeps only the blend strokes (the rest are drawn by the resident splat pass).
+fn collect_blend_splats_in_view(
+    doc: &app_core::document::Document,
+    view_min: glam::Vec2,
+    view_max: glam::Vec2,
+    out: &mut Vec<GpuSplat>,
+) {
+    out.clear();
+    for (idx, stroke) in doc.strokes.values().enumerate() {
+        if !stroke.gaussian_blend {
+            continue;
+        }
+        for splat in &stroke.splats {
+            let r = splat.radius_px + 2.0;
+            let c = splat.center;
+            let visible = c.x + r >= view_min.x
+                && c.x - r <= view_max.x
+                && c.y + r >= view_min.y
+                && c.y - r <= view_max.y;
+            if visible {
+                out.push(GpuSplat::from_splat(splat, idx as u32));
+            }
+        }
+    }
 }
 
 #[cfg(test)]

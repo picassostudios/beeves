@@ -112,7 +112,8 @@ async function boot(): Promise<void> {
     (tool: ToolName) => {
       currentTool = tool;
       app.set_tool(tool);
-      vectorControls.hidden = tool !== "vectordraw" && tool !== "vectorblend";
+      vectorControls.hidden =
+        tool !== "vectordraw" && tool !== "vectorblend" && tool !== "gaussianblend";
     },
     "brush"
   );
@@ -397,6 +398,7 @@ async function boot(): Promise<void> {
     b: "brush",
     d: "vectordraw",
     g: "vectorblend",
+    h: "gaussianblend",
     p: "bezier",
     a: "edit",
     s: "sculpt",
@@ -447,7 +449,11 @@ async function boot(): Promise<void> {
       const dpr = window.devicePixelRatio || 1;
       drawEditOverlay(overlayCtx, app.edit_overlay(), dpr);
       overlayShown = true;
-    } else if (currentTool === "vectordraw" || currentTool === "vectorblend") {
+    } else if (
+      currentTool === "vectordraw" ||
+      currentTool === "vectorblend" ||
+      currentTool === "gaussianblend"
+    ) {
       const dpr = window.devicePixelRatio || 1;
       drawVectorOverlay(overlayCtx, app.vector_overlay(), dpr);
       overlayShown = true;
